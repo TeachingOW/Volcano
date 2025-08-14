@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Volcano Optimizer Step-by-Step</title>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<style>
+body { font-family: Arial, sans-serif; margin:20px; }
+h1 { font-size:20px; margin-bottom:8px; }
+.grid { display:grid; grid-template-columns:360px 1fr; gap:16px; }
+.card { background:#fff; padding:12px; border-radius:10px; box-shadow:0 4px 12px rgba(0,0,0,0.05);}
+textarea,input[type=text]{width:100%; font-family:monospace; font-size:13px;}
+pre{background:#f0f8ff;padding:8px;border-radius:6px;font-size:13px;white-space:pre-wrap;}
+button{padding:6px 10px;border-radius:6px;background:#0b66ff;color:white;border:none;cursor:pointer;}
+button.alt{background:#eef6ff;color:#03306a;border:1px solid #dbeeff;}
+svg{border:1px solid #ddd; margin-top:8px;}
+.step-info{background:#f9f9f9;padding:8px;border-radius:6px;margin-top:8px;font-size:13px;}
+</style>
+</head>
+<body>
+<h1>Volcano Optimizer — Step-by-Step</h1>
+
+<div class="grid">
+<div class="card">
+<label>Tables (name:rows:hasIndex) comma-separated</label>
+<input id="tablesInput" type="text" value="A:1000:1,B:5000:0,C:2000:1">
+<small>1=index available, 0=no index</small>
+
+<label style="margin-top:10px">Filters/predicates (table condition selectivity)</label>
+<textarea id="predicatesInput" rows="4">A col1>5 0.1
+C colX=10 0.05</textarea>
+
+<label style="margin-top:10px">Joins (left right selectivity)</label>
+<textarea id="joinsInput" rows="4">A B 0.01
+B C 0.01</textarea>
+
+<label style="margin-top:10px">Cost parameters</label>
+<div style="display:flex;gap:8px">
+<div style="flex:1">
+<input id="ioRow" type="text" value="1.0"><small>IO per row</small>
+</div>
+<div style="flex:1">
+<input id="cpuRow" type="text" value="0.1"><small>CPU per row</small>
+</div>
+</div>
+
+<div style="margin-top:12px" class="row">
+<button id="prepareBtn">Prepare Steps</button>
+<button id="resetBtn" class="alt">Reset</button>
+</div>
+
+<div style="margin-top:10px" class="row" >
+<button id="prevStepBtn" class="alt">Previous Step</button>
+<button id="nextStepBtn">Next Step</button>
+</div>
+</div>
+
+<div class="card">
+<label>DP Table (incremental)</label>
+<div id="dpOut"><pre>(prepare steps first)</pre></div>
+
+<label style="margin-top:10px">Step Info</label>
+<div id="stepOut" class="step-info"><pre>(prepare steps first)</pre></div>
+
+<label style="margin-top:10px">Plan tree (SVG)</label>
+<div id="svgContainer"><svg id="planSvg" width="100%" height="400"></svg></div>
+</div>
+</div>
+
+<script>
+// ---------- Parsing ----------
+function parseTables(input){
+    const pairs = input.split(",").map(s=>s.trim()).filter(Boolean);
+    const names=[]; const sizes={}; const indexes={};
+    for(const p of pairs){
+        const [name,rowsStr,idxStr]=p.split(":").map(x=>x.trim());
+        if(!name) continue;
+        const rows=parseInt(rowsStr||"1000"); const idx=idxStr==="1";
+        names.push(name); sizes[name]=rows; indexes[name]=idx;
+    }
+    return {names,sizes,indexes};
+}
+function parsePredicates(lines){
+    const predMap=new Map();
+    lines.split("\n").map(l=>l.trim()).filter(Boolean).forEach(r=>{
+        const parts=r.split(/\s+/);
+        if(parts.length<3) return;
+        const t=parts[0], cond=parts[1], sel=parseFloat(parts[2]);
+        predMap.set(t, sel);
+    });
+    return predMap;
+}
+function parseJoins(lines){
+    const jm=new Map();
+    lines.split("\n").map(l=>l.trim()).filter(Boolean).forEach(r=>{
+        const [a,b,s]=r.split(/\s+/);
+        jm.set(keyPair(a,b),parseFloat(s));
+    });
+    return jm;
+}
+function keyPair(a,b){ return a<b?a+"|"+b:b+"|"+a; }
+
+// ---------- Plan nodes ----------
+function ScanNode(table,rows,cost,method){
+    return {kind:"scan",table,rows,cost,method,toString(){return method+"("+table+")";}};
+}
+function JoinNode(op,left,right,sel,rows,cost){
+    return {kind:"join",op,left,right,sel,rows,cost,
+        toString(indent=0){
+            const pad=" ".repeat(indent);
+            let s=`${pad}${op} sel=${sel.toFixed(3)} rows=${rows} cost=${cost.toFixed(2)}`;
+            s+="\n"+left.toString(indent+2)+"\n"+right.toString(indent+2);
+            return s;
+        }
+    };
+}
+
+// ---------- Cost ----------
+function getCostParams(){ return {io:parseFloat(document.getElementById('ioRow').value)||1, cpu:parseFloat(document.getElementById('cpuRow').value)||0.1}; }
+function costScan(rows,params,method){ return method==="IndexScan"?rows*params.cpu:rows*params.io; }
+function costHashJoin(left,right,params){ return left.cost+right.cost+(left.rows+right.rows)*params.cpu; }
+function costNLJ(left,right,params){ return left.cost+right.cost+(left.rows*right.rows)*params.cpu; }
+function computeCutSelectivity(left,right,joinMap){ 
+    const sels=[]; left.forEach(a=>right.forEach(b=>{const k=keyPair(a,b); if(joinMap.has(k)) sels.push(joinMap.get(k));}));
+    if(sels.length===0) return 0.1; return sels.reduce((a,b)=>a*b,1.0);
+}
+
+// ---------- DP Step Collector ----------
+let steps=[], dpTable=[], currentStep=-1, dpStructGlobal=null;
+
+function popcount(x){let c=0;while(x){c+=x&1;x>>=1;}return c;}
+function maskToNames(mask,idxToName){ const out=[]; for(let i=0;i<idxToName.length;i++) if(mask&(1<<i)) out.push(idxToName[i]); return out; }
+
+function prepareSteps(tables,sizes,indexes,predMap,joinMap,params){
+    const n=tables.length,N=1<<n;
+    const idxToName=tables.slice(), nameToIdx={}; for(let i=0;i<n;i++) nameToIdx[tables[i]]=i;
+    const dp=new Array(N).fill(null); dpTable=dp; steps=[]; currentStep=-1;
+
+    // base scans
+    for(let i=0;i<n;i++){
+        const mask=1<<i; const t=idxToName[i];
+        const sel=predMap.get(t)||1.0; const method=indexes[t]?"IndexScan":"SeqScan";
+        const row=Math.floor(sizes[t]*sel); const cost=costScan(row,params,method);
+        dp[mask]={cost,rows:row,node:ScanNode(t,row,cost,method),repr:t};
+    }
+
+    // collect steps
+    function* properSubmasks(mask){for(let sub=(mask-1)&mask;sub;sub=(sub-1)&mask){const other=mask^sub;if(other===0) continue; yield [sub,other];}}
+
+    const masksBySize=[]; for(let sz=2;sz<=n;sz++) masksBySize.push([]);
+    for(let mask=1;mask<N;mask++){const pc=popcount(mask); if(pc>=2) masksBySize[pc-2].push(mask);}
+    for(const group of masksBySize){
+        for(const mask of group){
+            let best=null;
+            for(const [lmask,rmask] of properSubmasks(mask)){
+                const left=dp[lmask], right=dp[rmask]; if(!left||!right) continue;
+                const leftNames=maskToNames(lmask,idxToName), rightNames=maskToNames(rmask,idxToName);
+                const sel=computeCutSelectivity(leftNames,rightNames,joinMap);
+                const rows=Math.max(1,Math.floor(left.rows*right.rows*sel));
+                const hcost=costHashJoin(left,right,params); const ncost=costNLJ(left,right,params);
+                const op=hcost<=ncost?"HashJoin":"NestedLoop"; const cst=Math.min(hcost,ncost);
+                const step={mask,lmask,rmask,left,right,sel,rows,hashCost:hcost,nljCost:ncost,chosenOp:op,chosenCost:cst};
+                steps.push(step);
+                if(!best||cst<best.cost) best={cost:cst,rows,node:JoinNode(op,left.node,right.node,sel,rows,cst),repr:`(${left.repr} ⋈ ${right.repr}) sel=${sel.toFixed(3)}`};
+            }
+            dp[mask]=best;
+        }
+    }
+    dpStructGlobal={dp,full:N-1,tables:idxToName};
+    return dpStructGlobal;
+}
+
+// ---------- UI ----------
+document.getElementById("prepareBtn").addEventListener("click",()=>{
+    const {names,sizes,indexes}=parseTables(document.getElementById("tablesInput").value);
+    const predMap=parsePredicates(document.getElementById("predicatesInput").value);
+    const joinMap=parseJoins(document.getElementById("joinsInput").value);
+    const params=getCostParams();
+    prepareSteps(names,sizes,indexes,predMap,joinMap,params);
+    currentStep=-1; updateStep(0);
+});
+
+document.getElementById("nextStepBtn").addEventListener("click",()=>{if(currentStep<steps.length-1) updateStep(currentStep+1);});
+document.getElementById("prevStepBtn").addEventListener("click",()=>{if(currentStep>0) updateStep(currentStep-1);});
+
+document.getElementById("resetBtn").addEventListener("click",()=>{
+    document.getElementById("tablesInput").value="A:1000:1,B:5000:0,C:2000:1";
+    document.getElementById("predicatesInput").value="A col1>5 0.1\nC colX=10 0.05";
+    document.getElementById("joinsInput").value="A B 0.01\nB C 0.01";
+    document.getElementById("ioRow").value="1.0"; document.getElementById("cpuRow").value="0.1";
+    steps=[]; currentStep=-1; dpTable=[]; document.getElementById("dpOut").innerHTML="<pre>(prepare steps first)</pre>";
+    document.getElementById("stepOut").innerHTML="<pre>(prepare steps first)</pre>";
+    document.getElementById("planSvg").innerHTML="";
+});
+
+// ---------- Step Update ----------
+function updateStep(stepIndex){
+    currentStep=stepIndex;
+    // apply step to DP table
+    const dp=dpStructGlobal.dp;
+    const step=steps[currentStep];
+    if(step){
+        const mask=step.mask;
+        // update dp[mask] with the current best if step is last candidate for that mask
+        const candidatesForMask=steps.filter(s=>s.mask===mask);
+        const idx=candidatesForMask.indexOf(step);
+        if(idx===candidatesForMask.length-1){
+            const left=step.left,right=step.right;
+            const node=JoinNode(step.chosenOp,left.node,right.node,step.sel,step.rows,step.chosenCost);
+            dp[mask]={cost:step.chosenCost, rows:step.rows,node,repr:`(${left.repr} ⋈ ${right.repr}) sel=${step.sel.toFixed(3)}`};
+        }
+    }
+    // update DP table display
+    document.getElementById("dpOut").innerHTML="<pre>"+prettyDP(dpStructGlobal)+"</pre>";
+    // update step info
+    if(step){
+        const info=`Step ${currentStep+1}/${steps.length}
+Processing mask: ${step.mask.toString(2).padStart(dpStructGlobal.tables.length,'0')} (${maskToNames(step.mask,dpStructGlobal.tables).join(",")})
+Left mask: ${step.lmask.toString(2).padStart(dpStructGlobal.tables.length,'0')} (${maskToNames(step.lmask,dpStructGlobal.tables).join(",")})
+Right mask: ${step.rmask.toString(2).padStart(dpStructGlobal.tables.length,'0')} (${maskToNames(step.rmask,dpStructGlobal.tables).join(",")})
+Candidate rows: ${step.rows}
+HashJoin cost: ${step.hashCost.toFixed(2)}
+NestedLoopJoin cost: ${step.nljCost.toFixed(2)}
+Chosen operator: ${step.chosenOp} (cost: ${step.chosenCost.toFixed(2)})`;
+        document.getElementById("stepOut").innerHTML="<pre>"+info+"</pre>";
+    } else {
+        document.getElementById("stepOut").innerHTML="<pre>(ready)</pre>";
+    }
+    // update SVG plan for full mask
+    drawPlanSVG(dp[dpStructGlobal.full].node);
+}
+
+// ---------- SVG ----------
+function drawPlanSVG(node){
+    const svg=document.getElementById("planSvg"); while(svg.firstChild) svg.innerHTML="";
+    const width=svg.clientWidth, levelHeight=60; const nodes=[];
+    function traverse(n,x,y){
+        nodes.push({n,x,y}); let dx=100;
+        if(n.kind==="join"){ traverse(n.left,x-dx,y+levelHeight); traverse(n.right,x+dx,y+levelHeight);}
+    }
+    traverse(node,width/2,20);
+    nodes.forEach(n=>{
+        if(n.n.kind==="join"){
+            const lx=n.x-100,ly=n.y+levelHeight;
+            const rx=n.x+100,ry=n.y+levelHeight;
+            const ns=nodes.find(x=>x.n===n.n.left); const ne=nodes.find(x=>x.n===n.n.right);
+            if(ns){ const line=document.createElementNS("http://www.w3.org/2000/svg","line"); line.setAttribute("x1",n.x); line.setAttribute("y1",n.y+10); line.setAttribute("x2",ns.x); line.setAttribute("y2",ns.y-10); line.setAttribute("stroke","black"); svg.appendChild(line);}
+            if(ne){ const line=document.createElementNS("http://www.w3.org/2000/svg","line"); line.setAttribute("x1",n.x); line.setAttribute("y1",n.y+10); line.setAttribute("x2",ne.x); line.setAttribute("y2",ne.y-10); line.setAttribute("stroke","black"); svg.appendChild(line);}
+        }
+    });
+    nodes.forEach(n=>{
+        const rect=document.createElementNS("http://www.w3.org/2000/svg","rect");
+        rect.setAttribute("x",n.x-40); rect.setAttribute("y",n.y-10); rect.setAttribute("width",80); rect.setAttribute("height",20); rect.setAttribute("fill","#cce5ff"); rect.setAttribute("stroke","#007bff");
+        svg.appendChild(rect);
+        const text=document.createElementNS("http://www.w3.org/2000/svg","text");
+        text.setAttribute("x",n.x); text.setAttribute("y",n.y+5); text.setAttribute("text-anchor","middle"); text.setAttribute("font-size","12px"); text.setAttribute("fill","black");
+        text.textContent=n.n.kind==="scan"?`${n.n.method}(${n.n.table}) rows=${n.n.rows}`:`${n.n.op} rows=${n.n.rows}`;
+        svg.appendChild(text);
+    });
+}
+
+// ---------- DP pretty ----------
+function prettyDP(dpStruct){
+    const {dp,tables}=dpStruct,n=tables.length; const rows=[]; rows.push("mask | tables | cost | estRows | repr");
+    for(let mask=1;mask<(1<<n);mask++){
+        const names=maskToNames(mask,tables).join(",");
+        const e=dp[mask];
+        rows.push(`${mask.toString(2).padStart(n,'0')} | ${names} | ${e?e.cost.toFixed(2):"-"} | ${e?e.rows:"-"} | ${e?e.repr:"-"}`);
+    }
+    return rows.join("\n");
+}
+</script>
+</body>
+</html>
