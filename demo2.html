@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Volcano-Style Optimizer — JS Implementation (Fixed)</title>
+<style>
+  :root{ --bg:#071028; --panel:#0f1b34; --muted:#9fb3d6; --text:#e6eeff; --accent:#6ee7ff; }
+  html,body{height:100%;margin:0;font-family:Inter, system-ui, -apple-system, 'Segoe UI', Roboto, Arial;background:linear-gradient(180deg,#061227 0%, #071028 100%);color:var(--text)}
+  header{padding:16px 20px;background:linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0));border-bottom:1px solid rgba(255,255,255,0.03);display:flex;align-items:center;justify-content:space-between}
+  h1{margin:0;font-size:18px}
+  .badge{background:#0c2440;padding:6px 10px;border-radius:999px;font-size:13px;color:var(--muted)}
+  .container{display:grid;grid-template-columns:360px 1fr;gap:16px;padding:16px}
+  .panel{background:var(--panel);padding:14px;border-radius:12px;border:1px solid rgba(255,255,255,0.02);box-shadow:0 6px 24px rgba(2,6,23,0.6);}
+  .panel h2{margin:0 0 10px;font-size:13px;color:var(--muted);} 
+  label{display:block;font-size:13px;color:var(--muted);margin-bottom:6px}
+  input[type=number], select{width:100%;padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,0.03);background:#071733;color:var(--text)}
+  .btn{padding:8px 12px;border-radius:8px;border:none;background:linear-gradient(90deg,#2b7abf,#7a5af8);color:white;cursor:pointer;margin-right:8px}
+  .btn.secondary{background:#12304f}
+  .flex{display:flex;gap:8px;align-items:center}
+  #steps{max-height:48vh;overflow:auto;margin-top:8px}
+  .step{background:#081231;padding:8px;border-radius:8px;margin-bottom:8px;border:1px solid rgba(255,255,255,0.02)}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  pre{background:#06142a;padding:10px;border-radius:8px;overflow:auto;white-space:pre-wrap}
+  table{width:100%;border-collapse:collapse}
+  th,td{padding:6px;border-bottom:1px solid rgba(255,255,255,0.03);text-align:left;font-size:13px}
+  .plan{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, monospace}
+  .node{background:#071733;padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,0.02);margin-bottom:8px}
+  .meta{color:var(--muted);font-size:12px}
+  @media(max-width:900px){.container{grid-template-columns:1fr;}}
+</style>
+</head>
+<body>
+<header>
+  <h1>Volcano-Style Optimizer — JS Implementation (Fixed)</h1>
+  <div class="badge">Interactive • Memo-based • Stepper</div>
+</header>
+<div class="container">
+  <div class="panel">
+    <h2>Controls</h2>
+    <label>Orders rows</label><input id="rows_orders" type="number" value="100000">
+    <label style="margin-top:8px">Customers rows</label><input id="rows_customers" type="number" value="10000">
+    <label style="margin-top:8px">Selectivity (0–1)</label><input id="selectivity" type="number" step="0.05" min="0" max="1" value="0.3">
+    <label style="margin-top:8px">Orders.amount indexed?</label>
+    <select id="has_index"><option value="no">No</option><option value="yes">Yes</option></select>
+
+    <div style="margin-top:12px" class="flex">
+      <button id="runBtn" class="btn">Run</button>
+      <button id="stepBtn" class="btn secondary">Step</button>
+      <button id="resetBtn" class="btn secondary">Reset</button>
+    </div>
+
+    <h2 style="margin-top:14px">Steps</h2>
+    <div id="steps"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Optimizer View</h2>
+    <div class="grid">
+      <div>
+        <h3 style="margin:0 0 8px;color:var(--muted)">Logical Plan</h3>
+        <pre id="logicalPre" class="plan">SELECT *\nFROM Orders o JOIN Customers c ON o.cust_id = c.id\nWHERE o.amount &gt; 100</pre>
+
+        <h3 style="margin-top:10px;color:var(--muted)">Memo Groups</h3>
+        <div id="memoDiv"></div>
+      </div>
+
+      <div>
+        <h3 style="margin:0 0 8px;color:var(--muted)">Best Plan (physical)</h3>
+        <div id="bestPlan"></div>
+
+        <h3 style="margin-top:10px;color:var(--muted)">Physical Alternatives</h3>
+        <div id="altsDiv"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ===== Simple Volcano-style optimizer in JS =====
+   - Logical nodes: Scan, Select, Join
+   - Transforms: Push-down select (simple)
+   - Implementations: SeqScan, IndexScan, Filter, HashJoin, NestedLoop
+   - Memo: map from logical key -> group with alternatives
+*/
+(function(){
+  // UI helpers
+  const $ = id => document.getElementById(id);
+  const appendStep = html => { const d = document.createElement('div'); d.className='step'; d.innerHTML=html; const s = $('steps'); if (s) s.prepend(d); };
+  const clearSteps = () => { const s = $('steps'); if (s) s.innerHTML=''; };
+
+  // Logical constructors
+  function LScan(table){ return {type:'scan', table}; }
+  function LSelect(child, pred){ return {type:'select', child, pred}; }
+  function LJoin(left, right, on){ return {type:'join', left, right, on}; }
+
+  // Physical constructors
+  function PSeqScan(table, rows, cost){ return {ptype:'seq', table, rows, cost}; }
+  function PIndexScan(table, rows, cost){ return {ptype:'index', table, rows, cost}; }
+  function PFilter(child, rows, sel, cost){ return {ptype:'filter', child, rows, sel, cost}; }
+  function PHashJoin(left, right, rows, cost){ return {ptype:'hash', left, right, rows, cost}; }
+  function PNLJ(left, right, rows, cost){ return {ptype:'nlj', left, right, rows, cost}; }
+
+  // Params
+  function params(){
+    return {
+      rowsO: Number($('rows_orders').value) || 100000,
+      rowsC: Number($('rows_customers').value) || 10000,
+      sel: Math.max(0, Math.min(1, Number($('selectivity').value) || 0.3)),
+      hasIndex: $('has_index').value === 'yes'
+    };
+  }
+
+  // Key for memo
+  function key(node){
+    if (node.type==='scan') return `Scan(${node.table})`;
+    if (node.type==='select') return `Select(${key(node.child)}|${node.pred})`;
+    if (node.type==='join') return `Join(${key(node.left)}|${key(node.right)}|${node.on})`;
+  }
+
+  // Simple transformation: push-down select when child is join and predicate only refers to left
+  function pushDown(node){
+    if (node.type==='select' && node.child && node.child.type==='join'){
+      // naive: always push to left
+      appendStep(`Applied <b>Push-Down</b>: moved predicate <code>${node.pred}</code> into left child`);
+      return LJoin(LSelect(node.child.left, node.pred), node.child.right, node.child.on);
+    }
+    if (node.type==='join'){
+      return LJoin(pushDown(node.left), pushDown(node.right), node.on);
+    }
+    if (node.type==='select') return LSelect(pushDown(node.child), node.pred);
+    return node;
+  }
+
+  // Memo
+  let memo = new Map();
+  function resetMemo(){ memo = new Map(); }
+
+  // Generate physical implementations for a logical node (using memo for children)
+  function implement(node, p){
+    const k = key(node);
+    if (memo.has(k) && memo.get(k).alts.length) return memo.get(k).alts;
+
+    // Ensure group exists
+    if (!memo.has(k)) memo.set(k, { logical: node, alts: [], best: null });
+    const group = memo.get(k);
+
+    // Apply transformation (single pass)
+    const x = pushDown(node);
+    if (key(x)!==k){ // new logical form
+      if (!memo.has(key(x))) memo.set(key(x), { logical: x, alts: [], best: null });
+    }
+
+    // Implementation rules
+    if (x.type==='scan'){
+      const size = x.table==='Orders' ? p.rowsO : p.rowsC;
+      group.alts.push({plan:PSeqScan(x.table,size,size), cost:size, rows:size});
+      if (p.hasIndex && x.table==='Orders'){
+        const r = Math.max(1, Math.round(size * p.sel));
+        const cost = Math.round(0.2 * size * p.sel + 500);
+        group.alts.push({plan:PIndexScan(x.table,r,cost), cost:cost, rows:r});
+      }
+    } else if (x.type==='select'){
+      const childAlts = implement(x.child,p);
+      for (const ch of childAlts){
+        const outRows = Math.max(1, Math.round(ch.rows * p.sel));
+        const cost = ch.cost + Math.round(ch.rows * p.sel);
+        group.alts.push({plan:PFilter(ch.plan,outRows,p.sel,cost), cost:cost, rows:outRows});
+      }
+    } else if (x.type==='join'){
+      const L = implement(x.left,p);
+      const R = implement(x.right,p);
+      for (const la of L) for (const ra of R){
+        const out = Math.max(1, Math.round(la.rows));
+        const hashCost = la.cost + ra.cost + la.rows + ra.rows;
+        const nljCost = la.cost + ra.cost + Math.round(0.0001 * la.rows * ra.rows);
+        group.alts.push({plan:PHashJoin(la.plan, ra.plan, out, hashCost), cost:hashCost, rows:out});
+        group.alts.push({plan:PNLJ(la.plan, ra.plan, out, nljCost), cost:nljCost, rows:out});
+      }
+    }
+
+    // pick best
+    if (group.alts.length) group.best = group.alts.reduce((a,b)=> a.cost<=b.cost? a:b);
+    appendStep(`Group <b>${k}</b>: generated ${group.alts.length} alternative(s); best cost=${group.best?group.best.cost:'—'}`);
+    return group.alts;
+  }
+
+  // Render functions
+  function renderMemo(){
+    const out = [];
+    for (const [k,g] of memo.entries()){
+      const alts = g.alts.map(a=> `<div class="node"><div><strong>${a.plan.ptype}</strong> — cost ${a.cost}, rows ${a.rows}</div></div>`).join('\n');
+      out.push(`<div style="margin-bottom:10px"><div class="meta"><strong>${k}</strong></div>${alts}</div>`);
+    }
+    $('memoDiv').innerHTML = out.join('') || '<div class="meta">(no groups yet)</div>';
+  }
+
+  function renderBest(rootKey){
+    const g = memo.get(rootKey);
+    if (!g || !g.best){ $('bestPlan').innerHTML = '<div class="meta">(no best)</div>'; return; }
+    $('bestPlan').innerHTML = renderPhys(g.best.plan) + `<div class="meta">cost: ${g.best.cost}, rows: ${g.best.rows}</div>`;
+  }
+
+  function renderPhys(p){
+    if (!p) return '';
+    if (p.ptype==='seq') return `<div class="node">SeqScan(${p.table})</div>`;
+    if (p.ptype==='index') return `<div class="node">IndexScan(${p.table})</div>`;
+    if (p.ptype==='filter') return `<div class="node">Filter — rows ${p.rows}<div style="margin-left:8px">${renderPhys(p.child)}</div></div>`;
+    if (p.ptype==='hash') return `<div class="node">HashJoin<div style="margin-left:8px">${renderPhys(p.left)}${renderPhys(p.right)}</div></div>`;
+    if (p.ptype==='nlj') return `<div class="node">NestedLoopJoin<div style="margin-left:8px">${renderPhys(p.left)}${renderPhys(p.right)}</div></div>`;
+    return JSON.stringify(p);
+  }
+
+  // Top-level optimize
+  function optimize(){
+    clearSteps(); resetMemo();
+    const p = params();
+    // logical root: Join( Select(Scan(Orders), amount>100), Scan(Customers) )
+    const root = LJoin(LSelect(LScan('Orders'), 'amount>100'), LScan('Customers'), 'o.cust_id=c.id');
+    const rootKey = key(root);
+    appendStep('<b>Start optimization</b>');
+    implement(root,p);
+    renderMemo(); renderBest(rootKey);
+  }
+
+  // Stepper: create groups in order: root->left->right->root implementations
+  let stepState = {phase:0, root:null, p:null};
+  function step(){
+    if (!stepState.root){ clearSteps(); resetMemo(); stepState.p = params(); stepState.root = LJoin(LSelect(LScan('Orders'),'amount>100'), LScan('Customers'),'o.cust_id=c.id'); appendStep('Created logical root'); renderMemo(); return; }
+    const r = stepState.root;
+    if (stepState.phase===0){ appendStep('Implementing left child'); implement(r.left, stepState.p); renderMemo(); stepState.phase++; return; }
+    if (stepState.phase===1){ appendStep('Implementing right child'); implement(r.right, stepState.p); renderMemo(); stepState.phase++; return; }
+    if (stepState.phase===2){ appendStep('Implementing root (join)'); implement(r, stepState.p); renderMemo(); renderBest(key(r)); stepState.phase++; return; }
+    appendStep('Done');
+  }
+
+  function reset(){ clearSteps(); resetMemo(); $('memoDiv').innerHTML=''; $('bestPlan').innerHTML=''; stepState={phase:0,root:null,p:null}; }
+
+  // Wire UI
+  $('runBtn').addEventListener('click', optimize);
+  $('stepBtn').addEventListener('click', step);
+  $('resetBtn').addEventListener('click', reset);
+
+  // initial render
+  reset();
+  appendStep('Ready — press Run or Step');
+})();
+</script>
+</body>
+</html>
