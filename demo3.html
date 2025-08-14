@@ -1,0 +1,483 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Volcano-style Optimizer (toy) — Demo</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; color: #0b1220; }
+    body { margin: 0; padding: 24px; background: #f6fafc; }
+    header { display:flex; align-items:center; gap:16px; margin-bottom:16px; }
+    h1 { margin:0; font-size:20px; }
+    .grid { display:grid; grid-template-columns: 1fr 1fr; gap:16px; align-items:start; }
+    .card { background: white; border-radius:12px; padding:12px; box-shadow: 0 6px 18px rgba(12,20,30,0.06); }
+    pre { white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, "Roboto Mono", monospace; font-size:13px; margin:0; }
+    button { background: #0563e8; color: white; border: none; padding:8px 12px; border-radius:8px; cursor:pointer; }
+    button:active { transform: translateY(1px); }
+    label { display:block; font-size:12px; margin-bottom:6px; color:#2b3a4a; }
+    textarea, input[type=text] { width:100%; font-family: ui-monospace, monospace; font-size:13px; }
+    .controls { display:flex; gap:8px; align-items:center; margin-bottom:10px; }
+    .small { font-size:12px; color:#5b6b7b; }
+    .mono { font-family: ui-monospace, monospace; font-size:13px; }
+    .cols { display:grid; grid-template-columns: 1fr 1fr; gap:8px; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Volcano-style Query Optimizer — Browser Demo</h1>
+      <div class="small">Toy/educational optimizer: memo, rewrite rules, enumerator & cost model.</div>
+    </div>
+  </header>
+
+  <div class="grid">
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <strong>Controls</strong>
+        <div class="small">Open the console (F12) for JS logs.</div>
+      </div>
+
+      <div style="margin-top:10px;">
+        <div class="controls">
+          <button id="runExampleBtn">Run built-in example</button>
+          <button id="clearBtn">Clear output</button>
+        </div>
+
+        <label for="customPlan">(Optional) Paste a logical plan here (JS) — example below:</label>
+        <textarea id="customPlan" rows="6" class="mono">// Example JS to replace the logical plan:
+Filter(
+  "A.value > 10 AND C.flag = 'x'",
+  Join(
+    Join(Scan("A"), Scan("B"), "A.id=B.a_id"),
+    Scan("C"),
+    "B.id=C.b_id"
+  )
+)</textarea>
+
+        <div style="margin-top:8px;">
+          <label>Table statistics (JSON)</label>
+          <textarea id="tableStats" rows="3" class="mono">{"A": {"rows":1000}, "B": {"rows":5000}, "C": {"rows":2000}}</textarea>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <strong>Output</strong>
+      <div style="margin-top:8px; display:grid; grid-template-rows: auto 1fr; gap:8px;">
+        <div class="cols">
+          <div>
+            <label>Memo groups</label>
+            <pre id="memoOut" style="height:200px; overflow:auto;"></pre>
+          </div>
+          <div>
+            <label>Best physical plan</label>
+            <pre id="planOut" style="height:200px; overflow:auto;"></pre>
+          </div>
+        </div>
+
+        <div>
+          <label>Details / Debug</label>
+          <pre id="debugOut" style="height:160px; overflow:auto;"></pre>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+  /**************************************************************************
+   * Volcano-style optimizer (browser-friendly)
+   * Adapted from the JS node example; prints to DOM instead of console only.
+   **************************************************************************/
+
+  // ----- Logical factories -----
+  function Scan(table) {
+    return {
+      type: "Scan",
+      table,
+      toString() { return `Scan(${this.table})`; }
+    };
+  }
+  function Filter(predicate, child) {
+    return {
+      type: "Filter",
+      predicate,
+      child,
+      toString() { return `Filter(${this.predicate}, ${this.child.toString()})`; }
+    };
+  }
+  function Join(left, right, cond) {
+    return {
+      type: "Join",
+      left,
+      right,
+      cond,
+      toString() { return `Join(${this.left.toString()}, ${this.right.toString()}, ${this.cond})`; }
+    };
+  }
+  function Project(cols, child) {
+    return {
+      type: "Project",
+      cols,
+      child,
+      toString() { return `Project(${this.cols.join(",")}, ${this.child.toString()})`; }
+    };
+  }
+
+  // ----- Memo -----
+  class Memo {
+    constructor() {
+      this.nextGroupId = 0;
+      this.groups = new Map();
+      this.exprKeyToGroup = new Map();
+    }
+
+    addExpr(expr) {
+      const makeKey = (e) => {
+        if (e.type === "Scan") {
+          return `Scan:${e.table}`;
+        } else if (e.type === "Filter") {
+          const childG = this.addExpr(e.child);
+          return `Filter:${e.predicate}:[g${childG}]`;
+        } else if (e.type === "Join") {
+          const lg = this.addExpr(e.left);
+          const rg = this.addExpr(e.right);
+          return `Join:[g${lg}]:[g${rg}]:${e.cond}`;
+        } else if (e.type === "Project") {
+          const childG = this.addExpr(e.child);
+          return `Project:${e.cols.join(",")}:[g${childG}]`;
+        } else {
+          throw new Error("Unknown expr type: " + e.type);
+        }
+      };
+
+      const key = makeKey(expr);
+      if (this.exprKeyToGroup.has(key)) {
+        return this.exprKeyToGroup.get(key);
+      }
+
+      const gid = this.nextGroupId++;
+      const exprRep = this._exprToRep(expr);
+      this.groups.set(gid, { id: gid, expressions: [exprRep], best: null });
+      this.exprKeyToGroup.set(key, gid);
+      return gid;
+    }
+
+    _exprToRep(e) {
+      if (e.type === "Scan") {
+        return { type: "Scan", table: e.table };
+      } else if (e.type === "Filter") {
+        const childG = this.addExpr(e.child);
+        return { type: "Filter", predicate: e.predicate, child: childG };
+      } else if (e.type === "Join") {
+        const lg = this.addExpr(e.left);
+        const rg = this.addExpr(e.right);
+        return { type: "Join", left: lg, right: rg, cond: e.cond };
+      } else if (e.type === "Project") {
+        const childG = this.addExpr(e.child);
+        return { type: "Project", cols: e.cols.slice(), child: childG };
+      } else {
+        throw new Error("Unknown expr type in _exprToRep: " + e.type);
+      }
+    }
+
+    addExprRepToGroup(groupId, exprRep) {
+      const g = this.groups.get(groupId);
+      const repKey = JSON.stringify(exprRep);
+      for (const ex of g.expressions) {
+        if (JSON.stringify(ex) === repKey) return false;
+      }
+      g.expressions.push(exprRep);
+      return true;
+    }
+  }
+
+  // ----- Predicate helpers -----
+  function tablesInStringPred(s) {
+    if (!s || typeof s !== "string") return new Set();
+    const re = /\b([A-Za-z_][A-Za-z0-9_]*)\.[A-Za-z_][A-Za-z0-9_]*\b/g;
+    const out = new Set();
+    let m;
+    while ((m = re.exec(s))) out.add(m[1]);
+    return out;
+  }
+  function collectTables(expr) {
+    const out = new Set();
+    const recurse = (e) => {
+      if (!e) return;
+      if (e.type === "Scan") { out.add(e.table); return; }
+      if (e.type === "Filter" || e.type === "Project") { recurse(e.child); return; }
+      if (e.type === "Join") { recurse(e.left); recurse(e.right); return; }
+    };
+    recurse(expr);
+    return out;
+  }
+
+  // ----- Rewrite rules -----
+  function applyRewriteRules(expr) {
+    const results = [];
+
+    // Filter(Filter(X)) => merged
+    if (expr.type === "Filter" && expr.child && expr.child.type === "Filter") {
+      const combined = `(${expr.predicate}) AND (${expr.child.predicate})`;
+      results.push(Filter(combined, expr.child.child));
+    }
+
+    // Pushdown through join
+    if (expr.type === "Filter" && expr.child && expr.child.type === "Join") {
+      const predTables = tablesInStringPred(expr.predicate);
+      const leftTables = collectTables(expr.child.left);
+      const rightTables = collectTables(expr.child.right);
+      const leftOnly = [...predTables].every(t => leftTables.has(t));
+      const rightOnly = [...predTables].every(t => rightTables.has(t));
+      if (leftOnly) {
+        results.push(Join(Filter(expr.predicate, expr.child.left), expr.child.right, expr.child.cond));
+      } else if (rightOnly) {
+        results.push(Join(expr.child.left, Filter(expr.predicate, expr.child.right), expr.child.cond));
+      }
+    }
+
+    // Join commutativity
+    if (expr.type === "Join") {
+      results.push(Join(expr.right, expr.left, expr.cond));
+    }
+
+    // Simple associativity
+    if (expr.type === "Join" && expr.left && expr.left.type === "Join") {
+      const A = expr.left.left, B = expr.left.right, C = expr.right;
+      results.push(Join(A, Join(B, C, expr.cond), expr.left.cond));
+    }
+
+    return results;
+  }
+
+  // ----- Explorer -----
+  class Explorer {
+    constructor(memo) { this.memo = memo; }
+    explore(rootExpr) {
+      const q = [rootExpr];
+      const seen = new Set();
+      while (q.length) {
+        const expr = q.shift();
+        const key = expr.toString();
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        const gid = this.memo.addExpr(expr);
+
+        const rewrites = applyRewriteRules(expr);
+        for (const r of rewrites) {
+          this.memo.addExpr(r);
+          if (!seen.has(r.toString())) q.push(r);
+        }
+      }
+    }
+  }
+
+  // ----- Cost model -----
+  const COST = { IO_ROW: 1.0, CPU_ROW: 0.1 };
+  function estimateSelectivity(predicate) {
+    if (!predicate) return 0.5;
+    if (predicate.includes("=")) return 0.1;
+    if (predicate.includes(">") || predicate.includes("<")) return 0.3;
+    return 0.5;
+  }
+  function estimateJoinSelectivity(cond) {
+    if (!cond) return 0.1;
+    if (cond.includes("=")) return 0.01;
+    return 0.1;
+  }
+
+  // ----- Enumerator -----
+  class Enumerator {
+    constructor(memo, tableStats) {
+      this.memo = memo;
+      this.tableStats = tableStats || {};
+      this.groupBest = new Map();
+    }
+
+    optimizeRootGroup(rootGroupId) { return this._optimizeGroup(rootGroupId); }
+
+    _optimizeGroup(gid) {
+      if (this.groupBest.has(gid)) return this.groupBest.get(gid);
+      const group = this.memo.groups.get(gid);
+      if (!group) throw new Error("Unknown group: " + gid);
+
+      let best = { plan: null, cost: Infinity, rows: Infinity };
+
+      for (const expr of group.expressions) {
+        if (expr.type === "Scan") {
+          const rows = (this.tableStats[expr.table] && this.tableStats[expr.table].rows) || 1000;
+          const cost = rows * COST.IO_ROW;
+          const plan = { op: "SeqScan", table: expr.table, cost, rows };
+          if (cost < best.cost) best = { plan, cost, rows };
+        } else if (expr.type === "Filter") {
+          const child = this._optimizeGroup(expr.child);
+          const sel = estimateSelectivity(expr.predicate);
+          const rows = Math.max(1, Math.floor(child.rows * sel));
+          const cpu = child.rows * COST.CPU_ROW;
+          const cost = child.cost + cpu;
+          const plan = { op: "Filter", predicate: expr.predicate, child: child.plan, cost, rows };
+          if (cost < best.cost) best = { plan, cost, rows };
+        } else if (expr.type === "Join") {
+          const left = this._optimizeGroup(expr.left);
+          const right = this._optimizeGroup(expr.right);
+          const joinSel = estimateJoinSelectivity(expr.cond);
+          const rows = Math.max(1, Math.floor(left.rows * right.rows * joinSel));
+
+          const nljCost = left.cost + right.cost + (left.rows * right.rows * COST.CPU_ROW);
+          const nljPlan = {
+            op: "NestedLoopJoin",
+            cond: expr.cond,
+            left: left.plan,
+            right: right.plan,
+            cost: nljCost,
+            rows
+          };
+
+          const buildSide = left.rows <= right.rows ? left : right;
+          const probeSide = left.rows <= right.rows ? right : left;
+          const hashCost = left.cost + right.cost + ((buildSide.rows + probeSide.rows) * COST.CPU_ROW);
+          const hashPlan = {
+            op: "HashJoin",
+            cond: expr.cond,
+            build: buildSide.plan,
+            probe: probeSide.plan,
+            cost: hashCost,
+            rows
+          };
+
+          const chosen = hashCost <= nljCost ? hashPlan : nljPlan;
+          if (chosen.cost < best.cost) best = { plan: chosen, cost: chosen.cost, rows: chosen.rows };
+        } else if (expr.type === "Project") {
+          const child = this._optimizeGroup(expr.child);
+          const rows = child.rows;
+          const cost = child.cost + rows * COST.CPU_ROW * 0.1;
+          const plan = { op: "Project", cols: expr.cols, child: child.plan, cost, rows };
+          if (cost < best.cost) best = { plan, cost, rows };
+        } else {
+          throw new Error("Unknown expression type during enumeration: " + expr.type);
+        }
+      }
+
+      this.groupBest.set(gid, best);
+      return best;
+    }
+  }
+
+  // ----- Printing helpers (write to DOM) -----
+  const memoOut = document.getElementById('memoOut');
+  const planOut = document.getElementById('planOut');
+  const debugOut = document.getElementById('debugOut');
+
+  function elClear() { memoOut.textContent = ""; planOut.textContent = ""; debugOut.textContent = ""; }
+  function appendDebug(s) { debugOut.textContent += s + "\\n"; debugOut.scrollTop = debugOut.scrollHeight; }
+  function renderMemo(memo) {
+    let out = [];
+    out.push(`Memo groups: ${memo.groups.size}`);
+    for (const [gid, g] of memo.groups.entries()) {
+      out.push(` Group ${gid}: (${g.expressions.length} exprs)`);
+      for (const ex of g.expressions) out.push("   - " + JSON.stringify(ex));
+    }
+    memoOut.textContent = out.join("\\n");
+  }
+
+  function printPlan(node, indent = "") {
+    if (!node) return "";
+    const lineFor = (n) => {
+      if (n.op === "SeqScan") return `${indent}${n.op}(${n.table}) [rows=${n.rows}, cost=${n.cost.toFixed(2)}]`;
+      if (n.op === "Filter") return `${indent}${n.op}(${n.predicate}) [rows=${n.rows}, cost=${n.cost.toFixed(2)}]`;
+      if (n.op === "NestedLoopJoin") return `${indent}${n.op}(cond=${n.cond}) [rows=${n.rows}, cost=${n.cost.toFixed(2)}]`;
+      if (n.op === "HashJoin") return `${indent}${n.op}(cond=${n.cond}) [rows=${n.rows}, cost=${n.cost.toFixed(2)}]`;
+      if (n.op === "Project") return `${indent}${n.op}(${n.cols.join(",")}) [rows=${n.rows}, cost=${n.cost.toFixed(2)}]`;
+      return `${indent}${JSON.stringify(n)}`;
+    };
+
+    let s = lineFor(node) + "\\n";
+    if (node.op === "SeqScan") return s;
+    if (node.op === "Filter") return s + printPlan(node.child, indent + "  ");
+    if (node.op === "Project") return s + printPlan(node.child, indent + "  ");
+    if (node.op === "NestedLoopJoin") {
+      s += printPlan(node.left, indent + "  L-> ");
+      s += printPlan(node.right, indent + "  R-> ");
+      return s;
+    }
+    if (node.op === "HashJoin") {
+      s += printPlan(node.build, indent + "  build-> ");
+      s += printPlan(node.probe, indent + "  probe-> ");
+      return s;
+    }
+    return s;
+  }
+
+  // ----- Example runner -----
+  function runOptimizerWithLogical(logical, stats) {
+    try {
+      elClear();
+      appendDebug("Starting optimizer...");
+
+      const memo = new Memo();
+      const explorer = new Explorer(memo);
+      explorer.explore(logical);
+      appendDebug("Explorer finished — memo populated.");
+      renderMemo(memo);
+
+      const rootGroupId = memo.addExpr(logical);
+      const enumr = new Enumerator(memo, stats);
+      const best = enumr.optimizeRootGroup(rootGroupId);
+
+      appendDebug(`Best cost: ${best.cost.toFixed(2)}, est rows: ${best.rows}`);
+      planOut.textContent = printPlan(best.plan);
+
+    } catch (err) {
+      appendDebug("ERROR: " + err.message);
+    }
+  }
+
+  // ----- Default example plan -----
+  function defaultLogicalPlan() {
+    return Filter(
+      "A.value > 10 AND C.flag = 'x'",
+      Join(
+        Join(Scan("A"), Scan("B"), "A.id=B.a_id"),
+        Scan("C"),
+        "B.id=C.b_id"
+      )
+    );
+  }
+
+  // ----- UI wiring -----
+  document.getElementById('runExampleBtn').addEventListener('click', () => {
+    const custom = document.getElementById('customPlan').value.trim();
+    let logical = null;
+    // If user pasted a plan, try to evaluate it safely in a sandbox-like way.
+    // This is a tiny demo: we will attempt to evaluate in a Function with Scan/Filter/Join/Project in scope.
+    if (custom) {
+      try {
+        const f = new Function('Scan','Filter','Join','Project','return (' + custom + ');');
+        logical = f(Scan, Filter, Join, Project);
+      } catch (err) {
+        appendDebug("Failed to parse custom plan; using default. (" + err.message + ")");
+      }
+    }
+    if (!logical) logical = defaultLogicalPlan();
+
+    let stats = {};
+    try {
+      stats = JSON.parse(document.getElementById('tableStats').value);
+    } catch (err) {
+      appendDebug("Failed to parse table stats JSON; using defaults.");
+      stats = { A: {rows:1000}, B:{rows:5000}, C:{rows:2000} };
+    }
+
+    appendDebug("Logical root: " + logical.toString());
+    runOptimizerWithLogical(logical, stats);
+  });
+
+  document.getElementById('clearBtn').addEventListener('click', () => elClear());
+
+  // run once on load to show something
+  document.getElementById('runExampleBtn').click();
+
+  </script>
+</body>
+</html>
