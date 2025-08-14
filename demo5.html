@@ -1,0 +1,595 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Volcano Optimizer — Step by Step</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  :root { font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; color:#0b1220; }
+  body { margin:0; padding:18px; background:#f6f9fb; }
+  header { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:14px; }
+  h1 { margin:0; font-size:18px; }
+  .layout { display:grid; grid-template-columns: 360px 1fr 420px; gap:14px; align-items:start; }
+  .card { background:white; padding:12px; border-radius:10px; box-shadow:0 6px 18px rgba(12,20,30,0.06); }
+  label { font-size:12px; color:#3b4a5a; display:block; margin-bottom:6px; }
+  textarea, input[type=text] { width:100%; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, "Roboto Mono", monospace; font-size:13px; }
+  pre { margin:0; white-space:pre-wrap; font-family: ui-monospace, monospace; font-size:13px; }
+  .controls { display:flex; gap:8px; align-items:center; margin-bottom:10px; }
+  button { background:#0570e6; color:white; border:0; padding:8px 10px; border-radius:8px; cursor:pointer; }
+  button.alt { background:#e6eefc; color:#05386b; border:1px solid #dfeffb; }
+  .step-title { font-weight:600; margin-bottom:8px; }
+  .panel { height:420px; overflow:auto; padding:8px; background:#fbfeff; border-radius:8px; border:1px dashed #e9f3fb; }
+  .muted { color:#5b6b7b; font-size:13px; }
+  .row { display:flex; gap:8px; align-items:center; }
+  .tag { font-size:12px; color:#0b1220; background:#eef6ff; padding:4px 8px; border-radius:999px; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Volcano-style Optimizer — Step-by-step Interactive</h1>
+    <div class="muted">Follow the 5 steps to see how logical plan → memo → rewrites → enumeration → physical plan works.</div>
+  </div>
+  <div class="row">
+    <div class="tag">Demo</div>
+    <div class="muted">Open dev console (F12) to see internal JS logs</div>
+  </div>
+</header>
+
+<div class="layout">
+  <!-- Left column: Inputs -->
+  <div class="card">
+    <div class="step-title">Inputs</div>
+
+    <label for="customPlan">Logical plan (JS factories)</label>
+    <textarea id="customPlan" rows="8">// Example (default):
+Filter(
+  "A.value > 10 AND C.flag = 'x'",
+  Join(
+    Join(Scan("A"), Scan("B"), "A.id=B.a_id"),
+    Scan("C"),
+    "B.id=C.b_id"
+  )
+)</textarea>
+
+    <label style="margin-top:8px">Table stats (JSON)</label>
+    <textarea id="tableStats" rows="3">{"A":{"rows":1000},"B":{"rows":5000},"C":{"rows":2000}}</textarea>
+
+    <div style="margin-top:10px" class="controls">
+      <button id="loadBtn">Load plan</button>
+      <button id="resetBtn" class="alt">Reset</button>
+    </div>
+
+    <div style="margin-top:8px">
+      <label class="muted">Quick tips</label>
+      <ul style="margin:6px 0 0 18px; padding:0;">
+        <li class="muted">Use the same factories: <code>Scan</code>, <code>Filter</code>, <code>Join</code>, <code>Project</code>.</li>
+        <li class="muted">Step 3 (Explore) supports stepping through each rewrite.</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- Middle column: Stepper + main panels -->
+  <div>
+    <div class="card" style="margin-bottom:12px">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div>
+          <div id="stepHeader" class="step-title">Step 1 — Show logical plan</div>
+          <div id="stepDesc" class="muted">Inspect the logical tree you provided.</div>
+        </div>
+        <div class="controls">
+          <button id="prevStep" class="alt">Prev</button>
+          <button id="nextStep">Next</button>
+          <button id="runAll" class="alt">Run all</button>
+        </div>
+      </div>
+
+      <div style="margin-top:10px; display:flex; gap:10px;">
+        <div style="flex:1">
+          <label>Logical plan (pretty)</label>
+          <div class="panel" id="logicalPanel"><pre id="logicalOut"></pre></div>
+        </div>
+
+        <div style="width:260px">
+          <label>Current state</label>
+          <div class="panel" id="statePanel"><pre id="stateOut"></pre></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div><strong>Explorer controls (Step 3 only)</strong></div>
+        <div class="muted">When on Step 3, use these to step rewrites.</div>
+      </div>
+
+      <div style="margin-top:8px;" class="controls">
+        <button id="applyNext" class="alt">Apply next rewrite</button>
+        <button id="applyAll">Apply all rewrites</button>
+      </div>
+
+      <div style="margin-top:8px; display:grid; grid-template-columns:1fr 1fr; gap:8px;">
+        <div>
+          <label>Rewrite queue</label>
+          <div class="panel" id="queuePanel"><pre id="queueOut"></pre></div>
+        </div>
+        <div>
+          <label>Recent explorer log</label>
+          <div class="panel" id="explorerLog"><pre id="explorerOut"></pre></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Right column: Outputs -->
+  <div class="card">
+    <div class="step-title">Outputs</div>
+
+    <label>Memo groups</label>
+    <div class="panel" id="memoPanel"><pre id="memoOut"></pre></div>
+
+    <label style="margin-top:8px">Enumeration / Best plans</label>
+    <div class="panel" id="enumPanel"><pre id="enumOut"></pre></div>
+
+    <label style="margin-top:8px">Final physical plan</label>
+    <div class="panel" id="planPanel"><pre id="planOut"></pre></div>
+  </div>
+</div>
+
+<script>
+/* ------------------------------
+   Volcano step-by-step demo
+   ------------------------------ */
+/* Logical factories */
+function Scan(table){ return {type:"Scan",table, toString(){return `Scan(${this.table})`;}}}
+function Filter(predicate, child){ return {type:"Filter",predicate,child, toString(){return `Filter(${this.predicate}, ${this.child.toString()})`;}}}
+function Join(left,right,cond){ return {type:"Join",left,right,cond, toString(){return `Join(${this.left.toString()}, ${this.right.toString()}, ${this.cond})`;}}}
+function Project(cols, child){ return {type:"Project", cols, child, toString(){return `Project(${this.cols.join(",")}, ${this.child.toString()})`;}}}
+
+/* Memo */
+class Memo {
+  constructor(){ this.nextGroupId = 0; this.groups = new Map(); this.exprKeyToGroup = new Map(); }
+  addExpr(expr){
+    const makeKey = (e) => {
+      if(e.type==="Scan") return `Scan:${e.table}`;
+      if(e.type==="Filter"){ const childG = this.addExpr(e.child); return `Filter:${e.predicate}:[g${childG}]`; }
+      if(e.type==="Join"){ const lg = this.addExpr(e.left); const rg = this.addExpr(e.right); return `Join:[g${lg}]:[g${rg}]:${e.cond}`; }
+      if(e.type==="Project"){ const childG=this.addExpr(e.child); return `Project:${e.cols.join(",")}:[g${childG}]`; }
+      throw new Error("Unknown expr type: "+e.type);
+    };
+    const key = makeKey(expr);
+    if(this.exprKeyToGroup.has(key)) return this.exprKeyToGroup.get(key);
+    const gid = this.nextGroupId++;
+    const exprRep = this._exprToRep(expr);
+    this.groups.set(gid,{id:gid, expressions:[exprRep], best:null});
+    this.exprKeyToGroup.set(key,gid);
+    return gid;
+  }
+  _exprToRep(e){
+    if(e.type==="Scan") return {type:"Scan",table:e.table};
+    if(e.type==="Filter"){ const childG=this.addExpr(e.child); return {type:"Filter", predicate:e.predicate, child:childG}; }
+    if(e.type==="Join"){ const lg=this.addExpr(e.left); const rg=this.addExpr(e.right); return {type:"Join", left:lg, right:rg, cond:e.cond}; }
+    if(e.type==="Project"){ const childG=this.addExpr(e.child); return {type:"Project", cols:e.cols.slice(), child:childG}; }
+    throw new Error("Unknown expr type in _exprToRep: "+e.type);
+  }
+}
+
+/* Predicate helpers */
+function tablesInStringPred(s){
+  if(!s || typeof s!=="string") return new Set();
+  const re = /\b([A-Za-z_][A-Za-z0-9_]*)\.[A-Za-z_][A-Za-z0-9_]*\b/g;
+  const out=new Set(); let m;
+  while((m=re.exec(s))) out.add(m[1]);
+  return out;
+}
+function collectTables(expr){
+  const out=new Set();
+  const recurse=(e)=>{
+    if(!e) return;
+    if(e.type==="Scan"){ out.add(e.table); return; }
+    if(e.type==="Filter"||e.type==="Project"){ recurse(e.child); return; }
+    if(e.type==="Join"){ recurse(e.left); recurse(e.right); return; }
+  };
+  recurse(expr);
+  return out;
+}
+
+/* Rewrite rules */
+function applyRewriteRules(expr){
+  const results=[];
+  if(expr.type==="Filter" && expr.child && expr.child.type==="Filter"){
+    const combined = `(${expr.predicate}) AND (${expr.child.predicate})`;
+    results.push(Filter(combined, expr.child.child));
+  }
+  if(expr.type==="Filter" && expr.child && expr.child.type==="Join"){
+    const predTables = tablesInStringPred(expr.predicate);
+    const leftTables = collectTables(expr.child.left);
+    const rightTables = collectTables(expr.child.right);
+    const leftOnly = [...predTables].every(t=>leftTables.has(t));
+    const rightOnly = [...predTables].every(t=>rightTables.has(t));
+    if(leftOnly) results.push(Join(Filter(expr.predicate, expr.child.left), expr.child.right, expr.child.cond));
+    else if(rightOnly) results.push(Join(expr.child.left, Filter(expr.predicate, expr.child.right), expr.child.cond));
+  }
+  if(expr.type==="Join") results.push(Join(expr.right, expr.left, expr.cond)); // commutativity
+  if(expr.type==="Join" && expr.left && expr.left.type==="Join"){
+    const A=expr.left.left, B=expr.left.right, C=expr.right;
+    results.push(Join(A, Join(B,C, expr.cond), expr.left.cond));
+  }
+  return results;
+}
+
+/* Explorer (incremental stepping) */
+class StepExplorer {
+  constructor(memo){
+    this.memo = memo;
+    this.queue = [];        // queue of expressions to process
+    this.seen = new Set();  // expression.toString() keys
+    this.log = [];
+  }
+  start(rootExpr){
+    this.queue = [rootExpr];
+    this.seen = new Set();
+    this.log = [];
+  }
+  hasNext(){ return this.queue.length>0; }
+  peek(){ return this.queue[0]; }
+  step(){ // process single queued expression
+    if(!this.queue.length) return {applied:[], addedGroups:[]};
+    const expr = this.queue.shift();
+    const key = expr.toString();
+    if(this.seen.has(key)) return {applied:[], addedGroups:[]};
+    this.seen.add(key);
+
+    // ensure expr present in memo (may already be)
+    const beforeGroups = this.memo.nextGroupId;
+    const gid = this.memo.addExpr(expr);
+    const afterGroups = this.memo.nextGroupId;
+    const addedGroups = [];
+    for(let i=beforeGroups;i<afterGroups;i++) addedGroups.push(i);
+
+    // apply rewrite rules to the expression
+    const rewrites = applyRewriteRules(expr);
+    const applied = [];
+    for(const r of rewrites) {
+      // record whether the rewrite added groups
+      const b = this.memo.nextGroupId;
+      this.memo.addExpr(r);
+      const a = this.memo.nextGroupId;
+      for(let i=b;i<a;i++) addedGroups.push(i);
+
+      const rk = r.toString();
+      if(!this.seen.has(rk)) this.queue.push(r);
+      applied.push(r);
+    }
+
+    // logging
+    const msg = `Processed: ${key} → generated ${applied.length} rewrite(s), new groups: ${addedGroups.length}`;
+    this.log.push(msg);
+    return {applied, addedGroups, logMsg:msg};
+  }
+}
+
+/* Cost model & Enumerator */
+const COST = { IO_ROW:1.0, CPU_ROW:0.1 };
+function estimateSelectivity(predicate){
+  if(!predicate) return 0.5;
+  if(predicate.includes("=")) return 0.1;
+  if(predicate.includes(">")||predicate.includes("<")) return 0.3;
+  return 0.5;
+}
+function estimateJoinSelectivity(cond){
+  if(!cond) return 0.1;
+  if(cond.includes("=")) return 0.01;
+  return 0.1;
+}
+
+class Enumerator {
+  constructor(memo, tableStats){
+    this.memo = memo;
+    this.tableStats = tableStats || {};
+    this.groupBest = new Map();
+  }
+  optimizeRootGroup(rootGroupId){ return this._optimizeGroup(rootGroupId); }
+  _optimizeGroup(gid){
+    if(this.groupBest.has(gid)) return this.groupBest.get(gid);
+    const group = this.memo.groups.get(gid);
+    if(!group) throw new Error("Unknown group: "+gid);
+    let best = {plan:null, cost:Infinity, rows:Infinity};
+    for(const expr of group.expressions){
+      if(expr.type==="Scan"){
+        const rows=(this.tableStats[expr.table] && this.tableStats[expr.table].rows) || 1000;
+        const cost=rows*COST.IO_ROW;
+        const plan={op:"SeqScan", table:expr.table, cost, rows};
+        if(cost<best.cost) best={plan,cost,rows};
+      } else if(expr.type==="Filter"){
+        const child = this._optimizeGroup(expr.child);
+        const sel = estimateSelectivity(expr.predicate);
+        const rows = Math.max(1, Math.floor(child.rows * sel));
+        const cpu = child.rows * COST.CPU_ROW;
+        const cost = child.cost + cpu;
+        const plan = {op:"Filter", predicate:expr.predicate, child: child.plan, cost, rows};
+        if(cost<best.cost) best={plan,cost,rows};
+      } else if(expr.type==="Join"){
+        const left = this._optimizeGroup(expr.left);
+        const right = this._optimizeGroup(expr.right);
+        const joinSel = estimateJoinSelectivity(expr.cond);
+        const rows = Math.max(1, Math.floor(left.rows * right.rows * joinSel));
+        const nljCost = left.cost + right.cost + (left.rows * right.rows * COST.CPU_ROW);
+        const nljPlan = {op:"NestedLoopJoin", cond:expr.cond, left:left.plan, right:right.plan, cost:nljCost, rows};
+        const buildSide = left.rows <= right.rows ? left : right;
+        const probeSide = left.rows <= right.rows ? right : left;
+        const hashCost = left.cost + right.cost + ((buildSide.rows + probeSide.rows) * COST.CPU_ROW);
+        const hashPlan = {op:"HashJoin", cond:expr.cond, build:buildSide.plan, probe:probeSide.plan, cost:hashCost, rows};
+        const chosen = hashCost <= nljCost ? hashPlan : nljPlan;
+        if(chosen.cost < best.cost) best={plan:chosen, cost:chosen.cost, rows:chosen.rows};
+      } else if(expr.type==="Project"){
+        const child = this._optimizeGroup(expr.child);
+        const rows = child.rows;
+        const cost = child.cost + rows * COST.CPU_ROW * 0.1;
+        const plan = {op:"Project", cols:expr.cols, child:child.plan, cost, rows};
+        if(cost<best.cost) best={plan,cost,rows};
+      } else throw new Error("Unknown expr type during enumeration: "+expr.type);
+    }
+    this.groupBest.set(gid, best);
+    return best;
+  }
+}
+
+/* Pretty printers */
+function prettyLogical(expr, indent=0){
+  if(!expr) return "";
+  const pad = " ".repeat(indent);
+  if(expr.type==="Scan") return pad + `Scan(${expr.table})\n`;
+  if(expr.type==="Filter") return pad + `Filter: ${expr.predicate}\n` + prettyLogical(expr.child, indent+2);
+  if(expr.type==="Join") return pad + `Join: ${expr.cond}\n` + prettyLogical(expr.left, indent+2) + prettyLogical(expr.right, indent+2);
+  if(expr.type==="Project") return pad + `Project: ${expr.cols.join(",")}\n` + prettyLogical(expr.child, indent+2);
+  return pad + JSON.stringify(expr) + "\n";
+}
+function prettyMemo(memo){
+  const lines=[];
+  lines.push(`groups: ${memo.groups.size}`);
+  for(const [gid,g] of memo.groups.entries()){
+    lines.push(` Group ${gid}: (${g.expressions.length} exprs)`);
+    g.expressions.forEach((ex,i)=> lines.push("   - "+JSON.stringify(ex)));
+  }
+  return lines.join("\n");
+}
+function prettyQueue(q){
+  if(!q || !q.length) return "(empty)";
+  return q.map((e,i)=> `${i}. ${e.toString()}`).join("\n");
+}
+function prettyEnumOut(enumr){
+  const lines=[];
+  for(const [gid, g] of enumr.memo.groups.entries()){
+    const best = enumr.groupBest.get(gid);
+    if(best){
+      lines.push(`Group ${gid}: best cost=${best.cost.toFixed(2)}, rows=${best.rows}`);
+      lines.push(`  plan: ${best.plan ? best.plan.op : "n/a"}`);
+    } else {
+      lines.push(`Group ${gid}: (not explored by enumerator)`);
+    }
+  }
+  return lines.join("\n");
+}
+function printPlan(node, indent=""){
+  if(!node) return "";
+  const line = (n)=>{
+    if(n.op==="SeqScan") return `${indent}${n.op}(${n.table}) [rows=${n.rows}, cost=${n.cost.toFixed(2)}]\n`;
+    if(n.op==="Filter") return `${indent}${n.op}(${n.predicate}) [rows=${n.rows}, cost=${n.cost.toFixed(2)}]\n`;
+    if(n.op==="NestedLoopJoin") return `${indent}${n.op}(cond=${n.cond}) [rows=${n.rows}, cost=${n.cost.toFixed(2)}]\n`;
+    if(n.op==="HashJoin") return `${indent}${n.op}(cond=${n.cond}) [rows=${n.rows}, cost=${n.cost.toFixed(2)}]\n`;
+    if(n.op==="Project") return `${indent}${n.op}(${n.cols.join(",")}) [rows=${n.rows}, cost=${n.cost.toFixed(2)}]\n`;
+    return `${indent}${JSON.stringify(n)}\n`;
+  };
+  let s = line(node);
+  if(node.op==="SeqScan") return s;
+  if(node.op==="Filter") return s + printPlan(node.child, indent+"  ");
+  if(node.op==="Project") return s + printPlan(node.child, indent+"  ");
+  if(node.op==="NestedLoopJoin") return s + printPlan(node.left, indent+"  L-> ") + printPlan(node.right, indent+"  R-> ");
+  if(node.op==="HashJoin") return s + printPlan(node.build, indent+"  build-> ") + printPlan(node.probe, indent+"  probe-> ");
+  return s;
+}
+
+/* App state */
+let logical = null;
+let tableStats = {};
+let memo = null;
+let explorer = null;
+let enumerator = null;
+let rootGroupId = null;
+
+/* UI bindings */
+const logicalOut = document.getElementById('logicalOut');
+const stateOut = document.getElementById('stateOut');
+const memoOut = document.getElementById('memoOut');
+const queueOut = document.getElementById('queueOut');
+const explorerOut = document.getElementById('explorerOut');
+const enumOut = document.getElementById('enumOut');
+const planOut = document.getElementById('planOut');
+
+const stepHeader = document.getElementById('stepHeader');
+const stepDesc = document.getElementById('stepDesc');
+
+let step = 1; // steps: 1..5
+
+function setStepHeader(){
+  const titles = {
+    1: "Step 1 — Show logical plan",
+    2: "Step 2 — Insert into Memo",
+    3: "Step 3 — Explore / Apply rewrites",
+    4: "Step 4 — Enumerate (DP / cost model)",
+    5: "Step 5 — Final physical plan"
+  };
+  const descs = {
+    1: "Inspect the logical tree you provided.",
+    2: "Add the logical plan into the memo (creates groups).",
+    3: "Step through rewrites one expression at a time (or apply all).",
+    4: "Run the enumerator to compute best physical plan for each group.",
+    5: "See the chosen physical plan for the root and cost estimate."
+  };
+  stepHeader.textContent = titles[step] || "";
+  stepDesc.textContent = descs[step] || "";
+}
+setStepHeader();
+
+/* core actions for steps */
+function actionShowLogical(){
+  logicalOut.textContent = prettyLogical(logical);
+  stateOut.textContent = `logical root: ${logical.toString()}\n(ready)`;
+}
+function actionInsertMemo(){
+  memo = new Memo();
+  // capture groups count before
+  const before = memo.nextGroupId;
+  rootGroupId = memo.addExpr(logical);
+  const after = memo.nextGroupId;
+  stateOut.textContent = `Inserted logical into memo. rootGroupId = ${rootGroupId}\n(groups created: ${after-before})`;
+  memoOut.textContent = prettyMemo(memo);
+  // prepare explorer (but don't start consuming queue until step 3)
+  explorer = new StepExplorer(memo);
+  explorer.start(logical);
+}
+function actionExploreStepOnce(){
+  if(!explorer) {
+    explorer = new StepExplorer(memo || new Memo());
+    explorer.start(logical);
+  }
+  if(!explorer.hasNext()){
+    explorerOut.textContent += "\n(Explorer queue empty)";
+    return;
+  }
+  const res = explorer.step();
+  explorerOut.textContent += res.logMsg + "\\n";
+  memoOut.textContent = prettyMemo(memo);
+  queueOut.textContent = prettyQueue(explorer.queue);
+  stateOut.textContent = `Explorer processed one expression. New groups: ${res.addedGroups.length}`;
+}
+function actionExploreAll(){
+  if(!explorer) explorer = new StepExplorer(memo || new Memo());
+  let cnt = 0;
+  while(explorer.hasNext()){
+    explorer.step();
+    cnt++;
+    if(cnt>5000) break; // safety guard
+  }
+  explorerOut.textContent += `Auto-applied ${cnt} steps.\\n`;
+  memoOut.textContent = prettyMemo(memo);
+  queueOut.textContent = prettyQueue(explorer.queue);
+  stateOut.textContent = `Explorer finished. Queue length: ${explorer.queue.length}`;
+}
+function actionEnumerate(){
+  if(!memo) memo = new Memo();
+  if(rootGroupId===null) rootGroupId = memo.addExpr(logical);
+  enumerator = new Enumerator(memo, tableStats);
+  const best = enumerator.optimizeRootGroup(rootGroupId);
+  enumOut.textContent = prettyEnumOut(enumerator);
+  stateOut.textContent = `Enumeration done. Root best cost: ${best.cost.toFixed(2)}, rows=${best.rows}`;
+  planOut.textContent = printPlan(best.plan);
+}
+function actionShowPlan(){
+  if(!enumerator) { enumOut.textContent="(run enumeration first)"; return; }
+  const best = enumerator.groupBest.get(rootGroupId);
+  if(!best){ planOut.textContent="(no best plan)"; return; }
+  planOut.textContent = printPlan(best.plan);
+}
+
+/* UI event handlers */
+document.getElementById('loadBtn').addEventListener('click', ()=>{
+  const txt = document.getElementById('customPlan').value.trim();
+  try {
+    const f = new Function('Scan','Filter','Join','Project','return (' + txt + ');');
+    logical = f(Scan,Filter,Join,Project);
+  } catch(e) {
+    alert("Failed to parse logical plan JS. Using default.\n" + e);
+    logical = Filter("A.value > 10 AND C.flag = 'x'", Join( Join(Scan("A"), Scan("B"), "A.id=B.a_id"), Scan("C"), "B.id=C.b_id"));
+  }
+  try {
+    tableStats = JSON.parse(document.getElementById('tableStats').value);
+  } catch(e) {
+    alert("Failed to parse table stats JSON. Using defaults.");
+    tableStats = {"A":{"rows":1000},"B":{"rows":5000},"C":{"rows":2000}};
+  }
+  // reset internal state for a fresh run
+  memo = null; explorer = null; enumerator = null; rootGroupId = null;
+  // auto-run step 1 display
+  step = 1; setStepHeader();
+  actionShowLogical();
+  memoOut.textContent = "(not yet created)";
+  queueOut.textContent = "(not yet created)";
+  enumOut.textContent = "(not yet run)";
+  planOut.textContent = "(not yet run)";
+  explorerOut.textContent = "";
+});
+
+document.getElementById('resetBtn').addEventListener('click', ()=>{
+  document.getElementById('customPlan').value = `Filter(
+  "A.value > 10 AND C.flag = 'x'",
+  Join(
+    Join(Scan("A"), Scan("B"), "A.id=B.a_id"),
+    Scan("C"),
+    "B.id=C.b_id"
+  )
+)`;
+  document.getElementById('tableStats').value = '{"A":{"rows":1000},"B":{"rows":5000},"C":{"rows":2000}}';
+  document.getElementById('loadBtn').click();
+});
+
+/* navigation buttons */
+document.getElementById('nextStep').addEventListener('click', ()=>{
+  if(step < 5) step++;
+  setStepHeader();
+  // run the action for the step we arrived at
+  if(step===1) actionShowLogical();
+  else if(step===2) actionInsertMemo();
+  else if(step===3) { // initialize explorer if not yet
+    if(!memo) actionInsertMemo();
+    explorerOut.textContent += "Explorer ready. Use 'Apply next rewrite' to process one item.\\n";
+    queueOut.textContent = prettyQueue(explorer.queue);
+    memoOut.textContent = prettyMemo(memo);
+  }
+  else if(step===4) actionEnumerate();
+  else if(step===5) actionShowPlan();
+});
+
+document.getElementById('prevStep').addEventListener('click', ()=>{
+  // simple backward navigation (doesn't revert memo changes) — for clarity we just move step pointer
+  if(step>1) step--;
+  setStepHeader();
+  if(step===1) actionShowLogical();
+  else if(step===2) {
+    memoOut.textContent = memo ? prettyMemo(memo) : "(not yet created)";
+    stateOut.textContent = memo ? `rootGroupId=${rootGroupId}` : "(not yet created)";
+  }
+  else if(step===3){
+    queueOut.textContent = explorer ? prettyQueue(explorer.queue) : "(not yet created)";
+  }
+  else if(step===4) enumOut.textContent = enumerator ? prettyEnumOut(enumerator) : "(not yet run)";
+});
+
+document.getElementById('runAll').addEventListener('click', ()=>{
+  // do all steps in sequence
+  if(!logical) document.getElementById('loadBtn').click();
+  actionShowLogical();
+  actionInsertMemo();
+  actionExploreAll();
+  actionEnumerate();
+  actionShowPlan();
+  step = 5; setStepHeader();
+});
+
+/* explorer controls */
+document.getElementById('applyNext').addEventListener('click', ()=>{
+  if(step !== 3) { alert("Switch to Step 3 to apply rewrites."); return; }
+  if(!memo) actionInsertMemo();
+  actionExploreStepOnce();
+});
+document.getElementById('applyAll').addEventListener('click', ()=>{
+  if(step !== 3) { alert("Switch to Step 3 to apply rewrites."); return; }
+  actionExploreAll();
+});
+
+/* bootstrap: load default */
+document.getElementById('loadBtn').click();
+</script>
+</body>
+</html>
