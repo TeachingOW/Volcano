@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Volcano-Style Optimizer — Interactive Demo</title>
+<style>
+  :root {
+    --bg: #0b1020;
+    --panel: #121933;
+    --muted: #8aa0c3;
+    --text: #e6ecff;
+    --accent: #6ee7ff;
+    --accent2: #a78bfa;
+    --good: #10b981;
+    --bad: #ef4444;
+    --warn: #f59e0b;
+    --code: #0a1026;
+    --chip: #1f2a4d;
+  }
+  html, body { height: 100%; }
+  body {
+    margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+    background: radial-gradient(1200px 600px at 80% -10%, #1b2450 0%, var(--bg) 55%);
+    color: var(--text);
+  }
+  header { display:flex; align-items:center; justify-content: space-between; padding: 16px 20px; border-bottom: 1px solid #263157; position: sticky; top:0; backdrop-filter: blur(6px); background: linear-gradient(0deg, rgba(11,16,32,0.0), rgba(11,16,32,0.8)); z-index:10; }
+  header h1 { margin: 0; font-weight: 800; letter-spacing: 0.3px; font-size: clamp(18px, 2.3vw, 28px); }
+  header .badge { font-size: 12px; opacity: .85; background: #1b2450; padding: 4px 8px; border-radius: 999px; border: 1px solid #2a3872; }
+
+  .wrap { display:grid; grid-template-columns: 320px 1fr; gap: 16px; padding: 16px; }
+  .left, .right { display:flex; flex-direction:column; gap:16px; }
+  .card { background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.0)); border: 1px solid #24305f; border-radius: 18px; padding: 14px 14px; }
+  .card h2 { margin: 0 0 8px 4px; font-size: 14px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); }
+  .muted { color: var(--muted); }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .controls .row { margin: 8px 0; }
+  input[type="number"], select, input[type="text"] { background: var(--code); color: var(--text); border:1px solid #28376f; padding:8px 10px; border-radius: 12px; width: 100%; }
+  .grid2 { display:grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .btn { cursor:pointer; background: #1a2550; border:1px solid #2c3c82; color:#d9e5ff; padding:8px 12px; border-radius: 12px; font-weight:600; }
+  .btn:disabled { opacity:.5; cursor:not-allowed; }
+  .btn.run { background: linear-gradient(90deg, #2b7abf, #7a5af8); border: none; }
+  .btn.step { background: #123c57; border-color:#1a5b83; }
+  .btn.reset { background: #3a1d2b; border-color:#6b2038; }
+
+  .chips { display:flex; gap:6px; flex-wrap:wrap; }
+  .chip { background: var(--chip); padding:3px 8px; border:1px solid #2f3e7d; border-radius:999px; font-size:12px; }
+
+  pre, code { background: var(--code); color: #e8eeff; padding:12px; border-radius: 12px; overflow:auto; border:1px solid #243163; }
+  pre { margin: 0; line-height: 1.2; }
+
+  /* Steps log */
+  #steps { display:flex; flex-direction:column; gap:8px; max-height: 42vh; overflow:auto; }
+  .step { background:#0e1433; border:1px solid #27336b; padding:10px; border-radius:12px; }
+  .step .t { font-size:12px; color:var(--muted); }
+
+  /* Memo table */
+  table { width:100%; border-collapse: collapse; }
+  th, td { font-size: 13px; padding: 8px 10px; border-bottom:1px dashed #2a396f; vertical-align: top; }
+  th { text-align: left; color: var(--muted); font-weight:600; }
+  .tag { display:inline-block; padding:2px 6px; border:1px solid #2d3c7a; border-radius:8px; font-size:12px; margin-right:4px; }
+  .best { color: var(--good); font-weight: 700; }
+  .warn { color: var(--warn); }
+  .bad { color: var(--bad); }
+
+  /* Plan view */
+  .plan { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+  .node { border:1px solid #2b3a77; border-radius: 12px; padding: 8px 10px; margin: 6px 0; background:#0e1638; }
+  .node .title { color: var(--accent); font-weight: 800; }
+  .node .meta { color: var(--muted); font-size:12px; }
+  .indent { margin-left: 22px; border-left: 1px dashed #2a3566; padding-left: 12px; }
+  .cost { color:#9ae6b4; font-weight:700; }
+
+  .legend { display:flex; gap:8px; flex-wrap:wrap; }
+  .legend span { font-size:12px; opacity:.85; }
+  .legend .box { width:10px; height:10px; display:inline-block; margin-right:6px; border-radius: 2px; }
+  .lgx { background:#0e1638; border:1px solid #2b3a77; }
+  .phx { background:#0e2438; border:1px solid #2b5977; }
+
+  .footer { text-align:center; color: var(--muted); font-size:12px; padding: 8px; opacity:.85; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Volcano-Style Optimizer — Interactive, Self‑Contained HTML</h1>
+    <span class="badge">Toy demo • Logical → Physical • Step-by-step</span>
+  </header>
+
+  <div class="wrap">
+    <div class="left">
+      <section class="card controls">
+        <h2>1) Schema & Query</h2>
+        <div class="grid2">
+          <div>
+            <div class="muted" style="margin:4px; font-weight:600;">Tables (rows)</div>
+            <div class="row"><label style="width:110px">Customers</label><input id="rows_customers" type="number" value="10000" min="1" step="100"></div>
+            <div class="row"><label style="width:110px">Orders</label><input id="rows_orders" type="number" value="100000" min="1" step="100"></div>
+            <div class="row"><label style="width:110px">Selectivity</label><input id="selectivity" type="number" value="0.30" min="0" max="1" step="0.05"></div>
+            <div class="row"><label style="width:110px">Has Index on <em>Orders.amount</em>?</label>
+              <select id="has_index"><option value="no" selected>No</option><option value="yes">Yes</option></select>
+            </div>
+          </div>
+          <div>
+            <div class="muted" style="margin:4px; font-weight:600;">Query (fixed)</div>
+            <pre class="plan" id="queryText">SELECT *
+FROM Orders o
+JOIN Customers c ON o.cust_id = c.id
+WHERE o.amount &gt; 100</pre>
+            <div class="chips" style="margin-top:8px">
+              <span class="chip">Logical: Join( Select(Scan(Orders), amount&gt;100), Scan(Customers) )</span>
+            </div>
+          </div>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <button id="btnRun" class="btn run">Run Optimization</button>
+          <button id="btnStep" class="btn step">Step</button>
+          <button id="btnReset" class="btn reset">Reset</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>2) Steps</h2>
+        <div id="steps"></div>
+      </section>
+
+      <section class="card">
+        <h2>3) Memo (Groups & Alternatives)</h2>
+        <div id="memo"></div>
+      </section>
+    </div>
+
+    <div class="right">
+      <section class="card">
+        <h2>4) Best Plan</h2>
+        <div class="legend" style="margin-bottom:6px">
+          <span><span class="box lgx"></span>Logical</span>
+          <span><span class="box phx"></span>Physical</span>
+        </div>
+        <div id="best"></div>
+      </section>
+
+      <section class="card">
+        <h2>Rules & Cost Model</h2>
+        <ul class="muted" style="margin-top:6px">
+          <li><strong>Implementation rules</strong>: Scan→SeqScan / IndexScan; Join→HashJoin / NestedLoopJoin; Select→Filter.</li>
+          <li><strong>Transformation rules</strong> (logical): Push-Down Selection; Join Commutativity (optional).</li>
+          <li><strong>Costs</strong> (toy):
+            <ul>
+              <li>SeqScan(T) = rows(T)</li>
+              <li>IndexScan(T,pred) = 0.2 × rows(T) × sel + 500 (if index exists)</li>
+              <li>Filter(X, pred) = cost(X) + rows(X) × sel</li>
+              <li>HashJoin(X,Y) = cost(X)+cost(Y)+ rows(X)+rows(Y)</li>
+              <li>NestedLoopJoin(X,Y) = cost(X)+cost(Y)+ 0.0001 × rows(X) × rows(Y)</li>
+            </ul>
+          </li>
+        </ul>
+      </section>
+
+      <section class="card">
+        <h2>Logical & Physical Trees (final)</h2>
+        <div id="trees"></div>
+      </section>
+
+      <div class="footer">This is a compact educational demo; not production-grade estimation or a full memoizing optimizer. ©</div>
+    </div>
+  </div>
+
+<script>
+// ======= Tiny Volcano-style Optimizer (Toy) ======= //
+(function(){
+  // --- Helpers ---
+  const el = (sel) => document.querySelector(sel);
+  const esc = (s) => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+  const uid = (()=>{let i=0; return ()=> (++i)+"";})();
+
+  // Logical operator constructors
+  function LScan(table){ return { kind:'LScan', table }; }
+  function LSelect(child, pred){ return { kind:'LSelect', child, pred }; }
+  function LJoin(left, right, on){ return { kind:'LJoin', left, right, on }; }
+
+  // Physical operator constructors
+  function PSeqScan(table, rows, cost){ return { kind:'PSeqScan', table, rows, cost }; }
+  function PIndexScan(table, rows, cost){ return { kind:'PIndexScan', table, rows, cost }; }
+  function PFilter(child, rows, sel, cost){ return { kind:'PFilter', child, rows, sel, cost }; }
+  function PHashJoin(left, right, rows, cost){ return { kind:'PHashJoin', left, right, rows, cost }; }
+  function PNLJ(left, right, rows, cost){ return { kind:'PNLJ', left, right, rows, cost }; }
+
+  // Cardinalities for base tables
+  function getParams(){
+    return {
+      rowsC: Number(el('#rows_customers').value) || 10000,
+      rowsO: Number(el('#rows_orders').value) || 100000,
+      sel: Math.min(1, Math.max(0, Number(el('#selectivity').value) || 0.3)),
+      hasIndex: el('#has_index').value === 'yes'
+    };
+  }
+
+  // Pretty printers
+  function ppLogical(n){
+    if (!n) return '';
+    switch(n.kind){
+      case 'LScan': return `Scan(${n.table})`;
+      case 'LSelect': return `Select(${ppLogical(n.child)}, ${n.pred})`;
+      case 'LJoin': return `Join(${ppLogical(n.left)}, ${ppLogical(n.right)}, on=${n.on})`;
+    }
+  }
+  function ppPhysical(n){
+    if (!n) return '';
+    switch(n.kind){
+      case 'PSeqScan': return `SeqScan(${n.table})`;
+      case 'PIndexScan': return `IndexScan(${n.table})`;
+      case 'PFilter': return `Filter(${ppPhysical(n.child)})`;
+      case 'PHashJoin': return `HashJoin(${ppPhysical(n.left)}, ${ppPhysical(n.right)})`;
+      case 'PNLJ': return `NestedLoopJoin(${ppPhysical(n.left)}, ${ppPhysical(n.right)})`;
+    }
+  }
+
+  // Small stable hash for logical memo keys
+  function keyOf(node){
+    switch(node.kind){
+      case 'LScan': return `Scan:${node.table}`;
+      case 'LSelect': return `Select(${keyOf(node.child)}|${node.pred})`;
+      case 'LJoin': {
+        // To keep it simple, do not normalize commutativity here
+        return `Join(${keyOf(node.left)}|${keyOf(node.right)}|${node.on})`;
+      }
+    }
+  }
+
+  // Cost model (toy)
+  function estimateLogicalRows(node, params){
+    switch(node.kind){
+      case 'LScan': return node.table==='Orders'? params.rowsO : params.rowsC;
+      case 'LSelect': return Math.max(1, Math.round(estimateLogicalRows(node.child, params) * params.sel));
+      case 'LJoin': {
+        const l = estimateLogicalRows(node.left, params);
+        const r = estimateLogicalRows(node.right, params);
+        // Assume PK-FK join: output ≈ rows(left after filter)
+        return Math.max(1, Math.round(l));
+      }
+    }
+  }
+
+  function implement(node, params){
+    // Returns array of candidate physical implementations with cost & out rows
+    switch(node.kind){
+      case 'LScan': {
+        const size = node.table==='Orders'? params.rowsO : params.rowsC;
+        const outRows = size;
+        const seqCost = size;
+        const cand = [ PSeqScan(node.table, outRows, seqCost) ];
+        if (params.hasIndex && node.table==='Orders'){
+          const idxCost = Math.round(0.2 * size * params.sel + 500);
+          cand.push(PIndexScan(node.table, Math.max(1, Math.round(size*params.sel)), idxCost));
+        }
+        return cand;
+      }
+      case 'LSelect': {
+        // Implement child first, then apply Filter
+        const childAlts = bestImplementations(node.child, params);
+        return childAlts.map(ch => {
+          const outRows = Math.max(1, Math.round(ch.rows * params.sel));
+          const cost = ch.cost + Math.round(ch.rows * params.sel);
+          return PFilter(ch, outRows, params.sel, cost);
+        });
+      }
+      case 'LJoin': {
+        const leftAlts = bestImplementations(node.left, params);
+        const rightAlts = bestImplementations(node.right, params);
+        const cands = [];
+        for (const L of leftAlts) for (const R of rightAlts){
+          const outRows = Math.max(1, Math.round(L.rows));
+          const hashCost = L.cost + R.cost + L.rows + R.rows;
+          cands.push(PHashJoin(L, R, outRows, hashCost));
+          const nljCost = L.cost + R.cost + Math.round(0.0001 * L.rows * R.rows);
+          cands.push(PNLJ(L, R, outRows, nljCost));
+        }
+        return cands;
+      }
+    }
+  }
+
+  // Memo structure
+  const state = {
+    memo: new Map(), // key -> { groupId, logical, alts:[{plan,cost,rows}], best }
+    steps: [],
+    finished: false,
+    rootKey: null,
+  };
+
+  function reset(){
+    state.memo.clear();
+    state.steps = [];
+    state.finished = false;
+    state.rootKey = null;
+    render();
+  }
+
+  function addStep(txt){
+    state.steps.push({ id: uid(), t: txt });
+    renderSteps();
+  }
+
+  function insertLogical(node){
+    const k = keyOf(node);
+    if (!state.memo.has(k)){
+      state.memo.set(k, { groupId: 'G'+(state.memo.size+1), logical: node, alts: [], best: null });
+      addStep(`Add group ${[...state.memo.values()].slice(-1)[0].groupId}: <code>${esc(ppLogical(node))}</code>`);
+    }
+    return k;
+  }
+
+  function transform(node){
+    // Push-down selection: Select(Join(A,B)) -> Join(Select(A), B) when predicate only touches A
+    // For our fixed query, it's already pushed. We'll still implement generic forms.
+    let changed = false;
+    function walk(n){
+      if (n.kind === 'LSelect' && n.child.kind === 'LJoin'){
+        // naive: assume pred belongs to left
+        const pushed = LJoin(LSelect(n.child.left, n.pred), n.child.right, n.child.on);
+        changed = true;
+        return pushed;
+      }
+      if (n.kind === 'LJoin'){
+        return LJoin(walk(n.left), walk(n.right), n.on);
+      }
+      if (n.kind === 'LSelect') return LSelect(walk(n.child), n.pred);
+      return n;
+    }
+    const out = walk(node);
+    if (changed){ addStep('Apply <b>Push-Down Selection</b>'); }
+    return out;
+  }
+
+  function bestImplementations(node, params){
+    const gkey = insertLogical(node);
+    const group = state.memo.get(gkey);
+
+    // If already computed, return current best alts (for nested calls)
+    if (group.alts.length){ return group.alts; }
+
+    // Recurse via transformations first (logical phase)
+    const xform = transform(node);
+    if (keyOf(xform) !== gkey){
+      const k2 = insertLogical(xform);
+      addStep(`Group ${group.groupId}: New logically equivalent form → <code>${esc(ppLogical(xform))}</code>`);
+    }
+
+    // Implementation phase
+    const cands = implement(xform, params);
+    cands.forEach(c => group.alts.push({ plan: c, cost: c.cost, rows: c.rows }));
+
+    // Choose best in group
+    group.best = group.alts.reduce((a,b)=> a.cost<=b.cost? a : b, group.alts[0]);
+    addStep(`Group ${group.groupId}: consider ${group.alts.length} impl(s); best = <b>${esc(ppPhysical(group.best.plan))}</b> <span class="cost">(cost ${group.best.cost})</span>`);
+
+    return group.alts;
+  }
+
+  function optimize(){
+    const params = getParams();
+    const logicalRoot = LJoin(LSelect(LScan('Orders'), 'amount>100'), LScan('Customers'), 'o.cust_id=c.id');
+    state.rootKey = insertLogical(logicalRoot);
+
+    // Explore bottom-up
+    const root = state.memo.get(state.rootKey).logical;
+    // children first
+    bestImplementations(root.left, params);
+    bestImplementations(root.right, params);
+    bestImplementations(root, params);
+
+    state.finished = true;
+    render();
+  }
+
+  function stepOnce(){
+    // A coarse stepper: insert root → left → right → root
+    if (state.finished) return;
+
+    const params = getParams();
+    if (!state.rootKey){
+      const logicalRoot = LJoin(LSelect(LScan('Orders'), 'amount>100'), LScan('Customers'), 'o.cust_id=c.id');
+      state.rootKey = insertLogical(logicalRoot);
+      render(); return;
+    }
+    const root = state.memo.get(state.rootKey).logical;
+    const m = state.memo;
+    const needLeft = !m.has(keyOf(root.left)) || !m.get(keyOf(root.left)).alts.length;
+    const needRight = !m.has(keyOf(root.right)) || !m.get(keyOf(root.right)).alts.length;
+    const needRoot = !m.get(state.rootKey).alts.length;
+
+    if (needLeft){ bestImplementations(root.left, params); render(); return; }
+    if (needRight){ bestImplementations(root.right, params); render(); return; }
+    if (needRoot){ bestImplementations(root, params); state.finished = true; render(); return; }
+  }
+
+  // ---- Rendering ----
+  function renderSteps(){
+    const box = el('#steps');
+    box.innerHTML = state.steps.slice().reverse().map(s => `<div class="step"><div class="t">Step #${s.id}</div><div>${s.t}</div></div>`).join('');
+  }
+
+  function renderMemo(){
+    const div = el('#memo');
+    if (!state.memo.size){ div.innerHTML = '<div class="muted">No groups yet. Press <b>Run</b> or <b>Step</b>.</div>'; return; }
+    const rows = [...state.memo.entries()].map(([k,g])=>{
+      const best = g.best ? `<span class="best">${esc(ppPhysical(g.best.plan))}</span> <span class="cost">(cost ${g.best.cost})</span>` : '<span class="warn">—</span>';
+      const alts = g.alts.map(a=> `${esc(ppPhysical(a.plan))} <span class="muted">[rows ${a.rows}, cost ${a.cost}]</span>`).join('<br>');
+      return `<tr>
+        <td><b>${g.groupId}</b></td>
+        <td><code>${esc(ppLogical(g.logical))}</code></td>
+        <td>${alts || '—'}</td>
+        <td>${best}</td>
+      </tr>`;
+    }).join('');
+
+    div.innerHTML = `<table>
+      <thead><tr><th>Group</th><th>Logical Expression</th><th>Physical Alternatives</th><th>Best in Group</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+  }
+
+  function renderBest(){
+    const box = el('#best');
+    if (!state.finished){ box.innerHTML = '<div class="muted">Best plan will appear here after optimization.</div>'; return; }
+    const root = state.memo.get(state.rootKey);
+    const best = root.best?.plan;
+    if (!best){ box.innerHTML = '<div class="muted">No best plan yet.</div>'; return; }
+
+    function renderPhys(n){
+      const cost = n.cost != null ? ` <span class="cost">(cost ${n.cost})</span>` : '';
+      switch(n.kind){
+        case 'PSeqScan': return `<div class="node"><div class="title">SeqScan ${n.table}${cost}</div></div>`;
+        case 'PIndexScan': return `<div class="node"><div class="title">IndexScan ${n.table}${cost}</div></div>`;
+        case 'PFilter': return `<div class="node"><div class="title">Filter${cost}</div><div class="indent">${renderPhys(n.child)}</div><div class="meta">rows≈${n.rows}</div></div>`;
+        case 'PHashJoin': return `<div class="node"><div class="title">HashJoin${cost}</div><div class="indent">${renderPhys(n.left)}</div><div class="indent">${renderPhys(n.right)}</div><div class="meta">rows≈${n.rows}</div></div>`;
+        case 'PNLJ': return `<div class="node"><div class="title">NestedLoopJoin${cost}</div><div class="indent">${renderPhys(n.left)}</div><div class="indent">${renderPhys(n.right)}</div><div class="meta">rows≈${n.rows}</div></div>`;
+      }
+    }
+
+    box.innerHTML = `<div class="plan">${renderPhys(best)}</div>`;
+  }
+
+  function renderTrees(){
+    const box = el('#trees');
+    if (!state.memo.size){ box.innerHTML = '<div class="muted">Run the demo to see trees.</div>'; return; }
+    const logicalRoot = state.memo.get(state.rootKey)?.logical;
+    if (!logicalRoot){ box.innerHTML = '<div class="muted">—</div>'; return; }
+
+    function renderLogical(n){
+      switch(n.kind){
+        case 'LScan': return `<div class="node"><div class="title">Scan ${n.table}</div></div>`;
+        case 'LSelect': return `<div class="node"><div class="title">Select <span class="meta">${esc(n.pred)}</span></div><div class="indent">${renderLogical(n.child)}</div></div>`;
+        case 'LJoin': return `<div class="node"><div class="title">Join <span class="meta">${esc(n.on)}</span></div><div class="indent">${renderLogical(n.left)}</div><div class="indent">${renderLogical(n.right)}</div></div>`;
+      }
+    }
+
+    const best = state.memo.get(state.rootKey)?.best?.plan;
+    function renderPhys(n){
+      if (!n) return '<div class="muted">—</div>';
+      switch(n.kind){
+        case 'PSeqScan': return `<div class="node"><div class="title">SeqScan ${n.table}</div></div>`;
+        case 'PIndexScan': return `<div class="node"><div class="title">IndexScan ${n.table}</div></div>`;
+        case 'PFilter': return `<div class="node"><div class="title">Filter</div><div class="indent">${renderPhys(n.child)}</div></div>`;
+        case 'PHashJoin': return `<div class="node"><div class="title">HashJoin</div><div class="indent">${renderPhys(n.left)}</div><div class="indent">${renderPhys(n.right)}</div></div>`;
+        case 'PNLJ': return `<div class="node"><div class="title">NestedLoopJoin</div><div class="indent">${renderPhys(n.left)}</div><div class="indent">${renderPhys(n.right)}</div></div>`;
+      }
+    }
+
+    box.innerHTML = `<div class="grid2">
+      <div><div class="muted" style="margin:4px 0 8px 2px; font-weight:700">Logical</div>${renderLogical(logicalRoot)}</div>
+      <div><div class="muted" style="margin:4px 0 8px 2px; font-weight:700">Physical (chosen)</div>${renderPhys(best)}</div>
+    </div>`;
+  }
+
+  function render(){
+    renderSteps();
+    renderMemo();
+    renderBest();
+    renderTrees();
+  }
+
+  // Wire controls
+  el('#btnRun').addEventListener('click', ()=>{ reset(); optimize(); });
+  el('#btnStep').addEventListener('click', ()=>{ stepOnce(); });
+  el('#btnReset').addEventListener('click', ()=>{ reset(); });
+
+  // Initial paint
+  render();
+})();
+</script>
+</body>
+</html>
