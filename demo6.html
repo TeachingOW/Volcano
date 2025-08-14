@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Volcano-style Join-order Optimizer — Complete Solution</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, Arial; margin: 18px; color:#0b1220; }
+    h1 { margin: 0 0 8px 0; font-size: 20px; }
+    .grid { display:grid; grid-template-columns: 360px 1fr; gap:14px; margin-top:14px; }
+    .card { background: #fff; padding:12px; border-radius:10px; box-shadow: 0 8px 22px rgba(12,20,30,0.06); }
+    label { font-size:13px; color:#394b5a; display:block; margin-bottom:6px; }
+    textarea, input[type=text] { width:100%; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, "Roboto Mono", monospace; font-size:13px; }
+    pre { white-space: pre-wrap; font-family: ui-monospace, monospace; font-size:13px; background:#f6fbff; padding:8px; border-radius:8px; }
+    button { background:#0b66ff; color:white; border:0; padding:8px 12px; border-radius:8px; cursor:pointer; }
+    button.alt { background:#eef6ff; color:#03306a; border:1px solid #dbeeff; }
+    .row { display:flex; gap:8px; align-items:center; }
+    table { border-collapse: collapse; width:100%; font-size:13px; }
+    th,td { border:1px solid #e6eef6; padding:6px 8px; text-align:left; }
+    .muted { color:#5b6b7b; font-size:13px; }
+    .small { font-size:12px; color:#5b6b7b; }
+    .plan { background:#fcffef; padding:8px; border-radius:8px; }
+  </style>
+</head>
+<body>
+  <h1>Volcano-style Join-order Optimizer — Complete Solution</h1>
+  <div class="muted">DP-based join ordering + physical implementation selection (HashJoin vs NestedLoopJoin). Enter tables and joins, then run.</div>
+
+  <div class="grid">
+    <div class="card">
+      <label>Tables (name:rows) — comma separated</label>
+      <input id="tablesInput" type="text" value="A:1000,B:5000,C:2000" />
+      <div class="small" style="margin-top:6px">Example: <code>A:1000,B:5000,C:2000</code></div>
+
+      <label style="margin-top:12px">Join conditions (one per line): <small class="small">(left right selectivity)</small></label>
+      <textarea id="joinsInput" rows="6">A B 0.01
+B C 0.01</textarea>
+      <div class="small" style="margin-top:6px">Example: <code>A B 0.01</code> describes a join condition A.id = B.a_id with estimated selectivity 0.01</div>
+
+      <label style="margin-top:12px">Cost model parameters</label>
+      <div class="row">
+        <div style="flex:1">
+          <input id="ioRow" type="text" value="1.0" />
+          <div class="small">IO cost / row</div>
+        </div>
+        <div style="width:12px"></div>
+        <div style="flex:1">
+          <input id="cpuRow" type="text" value="0.1" />
+          <div class="small">CPU cost / row</div>
+        </div>
+      </div>
+
+      <div style="margin-top:12px" class="row">
+        <button id="runBtn">Run optimizer</button>
+        <button id="resetBtn" class="alt">Reset example</button>
+      </div>
+
+      <div style="margin-top:10px" class="small muted">
+        Note: This is an educational optimizer — accuracy depends on table sizes and join selectivities you provide.
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <div>
+          <strong>Results</strong>
+          <div class="small muted">DP table, best join order, and final physical plan with cost estimates.</div>
+        </div>
+      </div>
+
+      <div style="margin-top:10px;">
+        <label>DP table (subset -> best plan)</label>
+        <div id="dpOut"><pre>(run optimizer)</pre></div>
+
+        <label style="margin-top:10px">Best join order & cost</label>
+        <div id="bestOut" class="plan"><pre>(run optimizer)</pre></div>
+
+        <label style="margin-top:10px">Full physical plan</label>
+        <div id="planOut"><pre>(run optimizer)</pre></div>
+      </div>
+    </div>
+  </div>
+
+<script>
+/*
+  Complete DP join-order optimizer
+  - Bitmask-based DP (Selinger style)
+  - For each subset S of tables, compute best plan (cost, rows, plan tree)
+  - For each split S = L ∪ R, consider joining best(L) and best(R) with hash / nlj
+  - Uses provided pairwise join selectivities to estimate result size across a cut
+*/
+
+/* Utilities */
+function parseTables(input) {
+  // "A:1000,B:5000,C:2000" -> { names: ["A","B","C"], sizes: {A:1000,...} }
+  const pairs = input.split(",").map(s => s.trim()).filter(Boolean);
+  const names = [];
+  const sizes = {};
+  for (const p of pairs) {
+    const [name,rowsStr] = p.split(":").map(x=>x.trim());
+    if (!name) continue;
+    const rows = parseInt(rowsStr || "1000", 10) || 1000;
+    names.push(name);
+    sizes[name] = rows;
+  }
+  return { names, sizes };
+}
+
+function parseJoins(lines) {
+  // lines: each "A B 0.01"
+  const joinMap = new Map(); // key "A|B" -> selectivity number
+  const rows = lines.split("\n").map(l => l.trim()).filter(Boolean);
+  for (const r of rows) {
+    const parts = r.split(/\s+/);
+    if (parts.length < 3) continue;
+    const a = parts[0], b = parts[1], s = parseFloat(parts[2]);
+    if (isNaN(s)) continue;
+    joinMap.set(keyPair(a,b), s);
+  }
+  return joinMap;
+}
+function keyPair(a,b){ return a < b ? a + "|" + b : b + "|" + a; }
+
+/* Cost model (reads from UI) */
+function getCostParams() {
+  const io = parseFloat(document.getElementById('ioRow').value) || 1.0;
+  const cpu = parseFloat(document.getElementById('cpuRow').value) || 0.1;
+  return { io, cpu };
+}
+
+/* Selectivity across two sets of tables:
+   - If there are known join conditions between pairs across the cut, we multiply their selectivities.
+   - If none, use default join selectivity (0.1)
+*/
+function computeCutSelectivity(leftTables, rightTables, joinMap) {
+  // find all join conditions with one table in left, one in right
+  const sels = [];
+  for (const a of leftTables) {
+    for (const b of rightTables) {
+      const k = keyPair(a,b);
+      if (joinMap.has(k)) sels.push(joinMap.get(k));
+    }
+  }
+  if (sels.length === 0) {
+    return 0.1; // default
+  }
+  // multiply selectivities (assumes independent conditions)
+  return sels.reduce((acc, x) => acc * x, 1.0);
+}
+
+/* Plan node constructors */
+function ScanNode(table, rows, cost) {
+  return { kind: "scan", table, rows, cost, toString() { return `Scan(${this.table})`; } };
+}
+function JoinNode(op, left, right, condSel, rows, cost) {
+  return { kind: "join", op, left, right, condSel, rows, cost,
+    toString(indent=0) {
+      const pad = " ".repeat(indent);
+      const header = `${pad}${op} (sel=${condSel}, rows=${rows}, cost=${cost.toFixed(2)})`;
+      return header + "\n" + left.toString(indent+2) + "\n" + right.toString(indent+2);
+    }
+  };
+}
+
+/* Join cost calculators */
+function costHashJoin(left, right, params) {
+  // cost = left.cost + right.cost + (left.rows + right.rows) * cpu
+  return left.cost + right.cost + (left.rows + right.rows) * params.cpu;
+}
+function costNestedLoop(left, right, params) {
+  // cost = left.cost + right.cost + left.rows * right.rows * cpu
+  return left.cost + right.cost + (left.rows * right.rows) * params.cpu;
+}
+
+/* DP join ordering algorithm */
+function optimizeJoinOrder(tables, sizes, joinMap, params) {
+  // tables: array of names, sizes: map name->rows
+  const n = tables.length;
+  if (n === 0) return null;
+  const N = 1 << n;
+
+  // Map table index to name and name to index
+  const idxToName = tables.slice();
+  const nameToIdx = {};
+  for (let i=0;i<n;i++) nameToIdx[tables[i]] = i;
+
+  // DP table: dp[mask] = bestPlan {cost, rows, node}
+  const dp = new Array(N).fill(null);
+
+  // base cases: single tables
+  for (let i=0;i<n;i++) {
+    const mask = 1 << i;
+    const table = idxToName[i];
+    const rows = sizes[table] || 1000;
+    const cost = rows * params.io; // scan cost
+    dp[mask] = { cost, rows, node: ScanNode(table, rows, cost), repr: table };
+  }
+
+  // helper: iterate non-empty proper submasks L of mask
+  function* properSubmasks(mask) {
+    // iterate all non-empty proper submasks
+    for (let sub = (mask - 1) & mask; sub; sub = (sub - 1) & mask) {
+      const other = mask ^ sub;
+      if (other === 0) continue;
+      yield [sub, other];
+    }
+  }
+
+  // For all masks with increasing number of bits
+  const masksBySize = [];
+  for (let size=2; size<=n; size++) {
+    masksBySize.push([]);
+  }
+  // collect masks grouped by popcount
+  for (let mask=1; mask<N; mask++) {
+    const pc = popcount(mask);
+    if (pc >= 2) masksBySize[pc-2].push(mask);
+  }
+
+  // Process masks in increasing size
+  for (let groupIndex=0; groupIndex<masksBySize.length; groupIndex++) {
+    for (const mask of masksBySize[groupIndex]) {
+      let best = null;
+
+      // iterate all splits: mask = leftMask ∪ rightMask
+      for (const [leftMask, rightMask] of properSubmasks(mask)) {
+        const left = dp[leftMask];
+        const right = dp[rightMask];
+        if (!left || !right) continue;
+
+        // build set of table names on each side
+        const leftNames = maskToNames(leftMask, idxToName);
+        const rightNames = maskToNames(rightMask, idxToName);
+
+        // estimate join selectivity across the cut
+        const sel = computeCutSelectivity(leftNames, rightNames, joinMap);
+
+        // estimate result rows
+        const resultRows = Math.max(1, Math.floor(left.rows * right.rows * sel));
+
+        // two physical join options
+        const hashCost = costHashJoin(left, right, params);
+        const nljCost = costNestedLoop(left, right, params);
+
+        // pick cheaper op for this split
+        const chosenOp = (hashCost <= nljCost) ? "HashJoin" : "NestedLoop";
+        const chosenCost = Math.min(hashCost, nljCost);
+
+        // total cost includes chosenCost (which already includes child costs) — but we already included child.cost
+        // dp candidate:
+        const candidate = {
+          cost: chosenCost,
+          rows: resultRows,
+          node: JoinNode(chosenOp, left.node, right.node, sel, resultRows, chosenCost),
+          repr: `(${left.repr} ⋈ ${right.repr}) [sel=${sel.toFixed(6)}]`
+        };
+
+        if (!best || candidate.cost < best.cost) best = candidate;
+      }
+
+      dp[mask] = best;
+    }
+  }
+
+  // full mask
+  const full = N - 1;
+  return { dp, full, tables: idxToName, dpInfo: { n, N, nameToIdx } };
+}
+
+/* helper: popcount */
+function popcount(x) {
+  let c = 0;
+  while (x) { c += x & 1; x >>= 1; }
+  return c;
+}
+
+/* convert mask to array of names */
+function maskToNames(mask, idxToName) {
+  const out = [];
+  for (let i=0;i<idxToName.length;i++) {
+    if (mask & (1<<i)) out.push(idxToName[i]);
+  }
+  return out;
+}
+
+/* pretty-print DP table */
+function prettyDP(dpStruct) {
+  const { dp, full, tables } = dpStruct;
+  const n = tables.length;
+  const rows = [];
+  rows.push("mask | tables | best cost | est rows | repr");
+  for (let mask=1; mask < (1<<n); mask++) {
+    const names = maskToNames(mask, tables).join(",");
+    const entry = dp[mask];
+    if (!entry) {
+      rows.push(`${mask.toString(2).padStart(n,'0')} | ${names} | (no plan)`);
+    } else {
+      rows.push(`${mask.toString(2).padStart(n,'0')} | ${names} | ${entry.cost.toFixed(4)} | ${entry.rows} | ${entry.repr}`);
+    }
+  }
+  return rows.join("\n");
+}
+
+/* helper to pretty print final plan */
+function prettyPlanString(node) {
+  if (!node) return "(no plan)";
+  return node.toString(0);
+}
+
+/* UI wiring and run */
+document.getElementById('runBtn').addEventListener('click', run);
+document.getElementById('resetBtn').addEventListener('click', () => {
+  document.getElementById('tablesInput').value = "A:1000,B:5000,C:2000";
+  document.getElementById('joinsInput').value = "A B 0.01\nB C 0.01";
+  document.getElementById('ioRow').value = "1.0";
+  document.getElementById('cpuRow').value = "0.1";
+  run();
+});
+
+function run() {
+  const tablesRaw = document.getElementById('tablesInput').value.trim();
+  const joinsRaw = document.getElementById('joinsInput').value.trim();
+  const { names, sizes } = parseTables(tablesRaw);
+  const joinMap = parseJoins(joinsRaw);
+  const params = getCostParams();
+
+  if (names.length === 0) {
+    alert("No tables specified.");
+    return;
+  }
+  if (names.length > 12) {
+    const ok = confirm("Large number of tables (>12) may be slow. Continue?");
+    if (!ok) return;
+  }
+
+  const dpStruct = optimizeJoinOrder(names, sizes, joinMap, params);
+  const dp = dpStruct.dp;
+  const fullMask = dpStruct.full;
+  const best = dp[fullMask];
+
+  // output DP table
+  document.getElementById('dpOut').innerHTML = "<pre>" + prettyDP(dpStruct) + "</pre>";
+
+  if (!best) {
+    document.getElementById('bestOut').innerHTML = "<pre>(no join plan found)</pre>";
+    document.getElementById('planOut').innerHTML = "<pre>(no plan)</pre>";
+    return;
+  }
+
+  // output best plan summary
+  const summary = [];
+  summary.push(`Best cost: ${best.cost.toFixed(4)}`);
+  summary.push(`Estimated output rows: ${best.rows}`);
+  summary.push(`Join order repr: ${best.repr}`);
+  document.getElementById('bestOut').innerHTML = "<pre>" + summary.join("\n") + "</pre>";
+
+  // output plan tree
+  document.getElementById('planOut').innerHTML = "<pre>" + prettyPlanString(best.node) + "</pre>";
+}
+
+/* run default on load */
+run();
+</script>
+</body>
+</html>
