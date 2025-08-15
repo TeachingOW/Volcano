@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Volcano Top-Down Optimizer — Step by Step</title>
+<style>
+  :root{
+    --bg:#f6f9fc;--card:#ffffff;--ink:#0b1220;--muted:#5b6b7a;--primary:#0b66ff;--border:#e6eef7;
+    --badge-bg:#eef6ff;--badge-br:#dbeeff;--join:#e9f3ff;--join-br:#79a6f6;--scan:#fff8e6;--scan-br:#f2c46b;
+  }
+  html,body{height:100%}
+  body{margin:0;font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Inter, Arial, "Apple Color Emoji", "Segoe UI Emoji";color:var(--ink);background:var(--bg)}
+  h1{font-size:20px;margin:16px 20px 8px}
+  .grid{display:grid;grid-template-columns:380px 1fr;gap:16px;padding:0 20px 20px}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:12px;box-shadow:0 6px 18px rgba(0,0,0,.04);padding:12px}
+  textarea,input[type=text]{width:100%;font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;font-size:13px}
+  textarea{resize:vertical}
+  pre{background:#f7fbff;border:1px solid var(--border);border-radius:8px;padding:10px;white-space:pre-wrap;overflow-wrap:anywhere;font-size:12.5px}
+  button{padding:8px 12px;border-radius:8px;border:1px solid transparent;background:var(--primary);color:white;cursor:pointer}
+  button.alt{background:#eef6ff;color:#03306a;border:1px solid #dbeeff}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .kv{display:grid;grid-template-columns:130px 1fr;gap:6px;align-items:center}
+  .badge{display:inline-block;padding:2px 8px;border-radius:999px;background:var(--badge-bg);border:1px solid var(--badge-br);color:#03306a;font-size:11px}
+  svg{border:1px solid var(--border);border-radius:8px;background:white}
+  .mono{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;color:var(--muted)}
+</style>
+</head>
+<body>
+  <h1>Volcano Top‑Down Optimizer — Step by Step</h1>
+  <div class="grid">
+    <div class="card">
+      <label>SQL Query</label>
+      <textarea id="sql" rows="6">SELECT *
+FROM A
+JOIN B ON A.id = B.aid
+JOIN C ON B.id = C.bid
+WHERE A.col1 > 5 AND C.colX = 10;</textarea>
+
+      <label style="margin-top:10px">Table sizes & index (name:rows:index)</label>
+      <input id="tables" type="text" value="A:1000:1,B:5000:0,C:2000:1" />
+      <div class="mono" style="margin-top:4px">index: 1=yes, 0=no</div>
+
+      <label style="margin-top:10px">Join selectivities (left right sel)</label>
+      <textarea id="joins" rows="3">A B 0.01
+B C 0.01</textarea>
+
+      <label style="margin-top:10px">Predicate selectivities (table cond sel)</label>
+      <textarea id="preds" rows="3">A col1>5 0.1
+C colX=10 0.05</textarea>
+
+      <label style="margin-top:10px">Cost parameters</label>
+      <div class="kv">
+        <div class="mono">IO per row</div><input id="io" type="text" value="1.0" />
+        <div class="mono">CPU per row</div><input id="cpu" type="text" value="0.1" />
+      </div>
+
+      <div class="row" style="margin-top:12px">
+        <button id="parse" class="alt">Parse Query</button>
+        <button id="prepare">Prepare Steps</button>
+        <button id="prev" class="alt" disabled>Previous</button>
+        <button id="next" disabled>Next</button>
+        <button id="reset" class="alt">Reset</button>
+      </div>
+      <div style="margin-top:8px">
+        <span class="badge">Top‑down</span> <span class="badge">Memoized</span> <span class="badge">DFS order</span> <span class="badge">Step‑by‑step</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <label>Memo table (optimized goals)</label>
+      <div id="memoOut"><pre>(prepare steps)</pre></div>
+
+      <label style="margin-top:10px">Step</label>
+      <div id="stepOut"><pre>(prepare steps)</pre></div>
+
+      <label style="margin-top:10px">Best plan (SVG)</label>
+      <svg id="svg" width="100%" height="420"></svg>
+    </div>
+  </div>
+
+<script>
+// ================= Helpers & Parsing =================
+function keyPair(a,b){return a<b?`${a}|${b}`:`${b}|${a}`}
+function parseTables(str){
+  const names=[], sizes={}, idx={};
+  str.split(",").map(s=>s.trim()).filter(Boolean).forEach(p=>{
+    const [n,r,i]=p.split(":").map(x=>x.trim());
+    if(!n) return; names.push(n); sizes[n]=parseInt(r||"1000",10); idx[n]=(i==="1");
+  });
+  return {names,sizes,idx};
+}
+function parsePreds(str){
+  const m=new Map();
+  str.split("\n").map(l=>l.trim()).filter(Boolean).forEach(r=>{
+    const parts=r.split(/\s+/); if(parts.length<3) return;
+    const t=parts[0], sel=parseFloat(parts[parts.length-1]);
+    if(!isNaN(sel)) m.set(t, sel);
+  });
+  return m;
+}
+function parseJoins(str){
+  const m=new Map();
+  str.split("\n").map(l=>l.trim()).filter(Boolean).forEach(r=>{
+    const [a,b,s]=r.split(/\s+/);
+    const sel=parseFloat(s);
+    if(a && b && !isNaN(sel)) m.set(keyPair(a,b), sel);
+  });
+  return m;
+}
+function parseSQL(sql){
+  const tables=[], joins=[], preds=[];
+  const f=sql.match(/FROM\s+([a-zA-Z_][\w]*)/i); if(f) tables.push(f[1]);
+  const re=/JOIN\s+([a-zA-Z_][\w]*)\s+ON\s+([a-zA-Z_][\w]*)\.[^\s=]+\s*=\s*([a-zA-Z_][\w]*)\.[^\s)]+/ig;
+  let m; while((m=re.exec(sql))){ const t=m[1]; if(!tables.includes(t)) tables.push(t); joins.push({l:m[2], r:m[3]}); }
+  const w=sql.match(/WHERE\s+(.+)/i); if(w){ w[1].split(/AND/i).map(s=>s.trim()).filter(Boolean).forEach(c=>{ const t=c.split(".")[0]; preds.push({t,cond:c,sel:0.1}); }); }
+  return {tables,joins,preds};
+}
+
+// ================ Cost Model =================
+function params(){ return {io:parseFloat(document.getElementById('io').value)||1.0, cpu:parseFloat(document.getElementById('cpu').value)||0.1}; }
+function costScan(rows,p,method){ return method==="IndexScan" ? rows*p.cpu : rows*p.io; }
+function costHash(L,R,p){ return L.cost+R.cost + (L.rows+R.rows)*p.cpu; }
+function costNLJ(L,R,p){ return L.cost+R.cost + (L.rows*R.rows)*p.cpu; }
+function popcount(x){ let c=0; while(x){ c+=x&1; x>>=1; } return c; }
+
+// ================ Estimation =================
+let IDX2NAME=[], NAME2IDX={};
+function maskToNames(mask){ const arr=[]; for(let i=0;i<IDX2NAME.length;i++) if(mask&(1<<i)) arr.push(IDX2NAME[i]); return arr; }
+function computeCutSel(Lnames,Rnames,joinMap){
+  const sels=[]; for(const a of Lnames) for(const b of Rnames){ const k=keyPair(a,b); if(joinMap.has(k)) sels.push(joinMap.get(k)); }
+  return sels.length ? sels.reduce((a,b)=>a*b,1.0) : 0.1; // default if Cartesian
+}
+
+// ================ Plan Nodes =================
+function ScanNode(table, rows, cost, method){ return { kind:"scan", table, rows, cost, method } }
+function JoinNode(op,left,right,sel,rows,cost){ return { kind:"join", op, left, right, sel, rows, cost } }
+
+// ================ Volcano Top-Down (step generator) =================
+let STEPS=[], MEMO_GEN, FULL_MASK, SIZES, INDEXES, PREDMAP, JOINMAP, P;
+
+function buildBase(mask){
+  const i=(Math.log2(mask)|0); const t=IDX2NAME[i];
+  const sel=PREDMAP.get(t) ?? 1.0; const method = INDEXES[t] ? "IndexScan" : "SeqScan";
+  const rows=Math.max(1, Math.floor((SIZES[t]||1000) * sel));
+  const cost=costScan(rows,P,method);
+  const node=ScanNode(t,rows,cost,method);
+  return {rows,cost,node,repr:t,mask};
+}
+
+function properSplits(mask){ // unique (L,R) with L<R
+  const outs=[]; for(let sub=((mask-1)&mask); sub; sub=((sub-1)&mask)){ const other=mask^sub; if(other===0) continue; if(sub<other) outs.push([sub,other]); }
+  return outs;
+}
+
+function namesForMask(mask){ return maskToNames(mask).join(","); }
+
+function chooseBest(mask){
+  if(MEMO_GEN.has(mask)){ STEPS.push({type:"memo_hit", mask}); return MEMO_GEN.get(mask); }
+  if(mask===FULL_MASK){ STEPS.push({type:"root_goal", mask, names:namesForMask(mask)}); }
+  STEPS.push({type:"expand_goal", mask, names:namesForMask(mask)});
+
+  if(popcount(mask)===1){
+    const plan=buildBase(mask);
+    STEPS.push({type:"base_scan", mask, plan});
+    MEMO_GEN.set(mask, plan);
+    STEPS.push({type:"memoize", mask, plan});
+    return plan;
+  }
+
+  let best=null; const splits=properSplits(mask);
+  for(const [L,R] of splits){
+    STEPS.push({type:"consider_split", mask, L, R, Lnames:namesForMask(L), Rnames:namesForMask(R)});
+    const left = chooseBest(L);
+    const right= chooseBest(R);
+
+    const sel = computeCutSel(maskToNames(L), maskToNames(R), JOINMAP);
+    const outRows = Math.max(1, Math.floor(left.rows*right.rows*sel));
+
+    const h = costHash(left,right,P); STEPS.push({type:"cost_candidate", mask, L, R, op:"HashJoin", sel, outRows, cost:h});
+    const n = costNLJ(left,right,P);  STEPS.push({type:"cost_candidate", mask, L, R, op:"NestedLoop", sel, outRows, cost:n});
+
+    const op = h<=n?"HashJoin":"NestedLoop"; const c = Math.min(h,n);
+    const cand = { rows:outRows, cost:c, node:JoinNode(op,left.node,right.node,sel,outRows,c), repr:`(${left.repr} ⋈ ${right.repr})`, mask };
+    if(!best || cand.cost<best.cost){ best=cand; STEPS.push({type:"update_best", mask, best}); }
+  }
+  MEMO_GEN.set(mask, best);
+  STEPS.push({type:"memoize", mask, plan:best});
+  return best;
+}
+
+function prepareTopDown(tables, sizes, idx, predMap, joinMap){
+  IDX2NAME=tables.slice(); NAME2IDX={}; tables.forEach((t,i)=>NAME2IDX[t]=i);
+  SIZES=sizes; INDEXES=idx; PREDMAP=predMap; JOINMAP=joinMap; P=params();
+  FULL_MASK=(1<<tables.length)-1; MEMO_GEN=new Map(); STEPS=[];
+  chooseBest(FULL_MASK); // generate DFS steps
+}
+
+// ================ Step Replay (UI state) =================
+let CUR=-1; // step index
+let MEMO_REPLAY=new Map(); // memo as seen by replay
+let BEST_WORKING={}; // best-so-far per mask (for display while exploring)
+
+function applyStep(i){
+  CUR=i; const s=STEPS[CUR]; if(!s){ renderAll(); return; }
+  switch(s.type){
+    case "root_goal": {
+      // purely informational — ensures the very first step is the root join goal
+      break;
+    }
+    case "expand_goal": {
+      if(!(s.mask in BEST_WORKING)) BEST_WORKING[s.mask]=null; break;
+    }
+    case "memo_hit": { break; }
+    case "base_scan": { BEST_WORKING[s.mask]=s.plan; break; }
+    case "consider_split": { break; }
+    case "cost_candidate": { break; }
+    case "update_best": { BEST_WORKING[s.mask]=s.best; break; }
+    case "memoize": { MEMO_REPLAY.set(s.mask, s.plan); break; }
+  }
+  renderAll(s);
+}
+
+function stepNext(){ if(CUR<STEPS.length-1){ applyStep(CUR+1);} updateButtons(); }
+function stepPrev(){ if(CUR>-1){
+  const target=CUR-1; MEMO_REPLAY=new Map(); BEST_WORKING={}; CUR=-1;
+  for(let k=0;k<=target;k++) applyStep(k);
+  if(target<0) renderAll();
+  }
+  updateButtons();
+}
+function updateButtons(){
+  document.getElementById('prev').disabled = CUR<=-1;
+  document.getElementById('next').disabled = !(STEPS && CUR<STEPS.length-1);
+}
+
+// ================ Rendering =================
+function prettyMask(mask){ return mask.toString(2).padStart(IDX2NAME.length,'0')+" ("+maskToNames(mask).join(",")+")"; }
+function prettyMemo(){
+  const lines=["mask | tables | cost | rows | repr"]; const N=1<<IDX2NAME.length;
+  for(let m=1;m<N;m++){
+    const e = MEMO_REPLAY.get(m) || BEST_WORKING[m]; const names=maskToNames(m).join(",");
+    if(e) lines.push(`${m.toString(2).padStart(IDX2NAME.length,'0')} | ${names} | ${e.cost.toFixed(2)} | ${e.rows} | ${e.repr}`);
+    else lines.push(`${m.toString(2).padStart(IDX2NAME.length,'0')} | ${names} | - | - | -`);
+  }
+  return lines.join("\n");
+}
+function prettyStep(s){
+  if(!s) return "(ready)";
+  switch(s.type){
+    case "root_goal": return `ROOT GOAL: Join(${s.names})`;
+    case "expand_goal": return `Expand goal: ${prettyMask(s.mask)}`;
+    case "memo_hit": return `Memo hit: ${prettyMask(s.mask)}`;
+    case "base_scan": return `Base scan: ${prettyMask(s.mask)} → ${s.plan.node.method}(${s.plan.repr}) rows=${s.plan.rows} cost=${s.plan.cost.toFixed(2)}`;
+    case "consider_split": return `Consider split for ${prettyMask(s.mask)}\n  L=${prettyMask(s.L)}\n  R=${prettyMask(s.R)}`;
+    case "cost_candidate": return `Cost candidate for ${prettyMask(s.mask)} via ${s.op}\n  sel=${s.sel.toFixed(6)} rows=${s.outRows} cost=${s.cost.toFixed(2)}`;
+    case "update_best": return `Update best for ${prettyMask(s.mask)}\n  cost=${s.best.cost.toFixed(2)} rows=${s.best.rows} repr=${s.best.repr}`;
+    case "memoize": return `Memoize ${prettyMask(s.mask)} ✓\n  best cost=${s.plan.cost.toFixed(2)} rows=${s.plan.rows} repr=${s.plan.repr}`;
+    default: return JSON.stringify(s,null,2);
+  }
+}
+
+function drawPlanSVG(node){
+  const svg=document.getElementById('svg'); while(svg.firstChild) svg.removeChild(svg.firstChild);
+  const W=svg.clientWidth||700, H=420, LH=70, DX=120; svg.setAttribute('height',H);
+  if(!node){ const t=document.createElementNS('http://www.w3.org/2000/svg','text'); t.setAttribute('x',16); t.setAttribute('y',24); t.textContent='(no full plan yet)'; t.setAttribute('fill','#6b7785'); t.setAttribute('font-size','12px'); svg.appendChild(t); return; }
+  const nodes=[];
+  function layout(n,x,y){ nodes.push({n,x,y}); if(n.kind==='join'){ layout(n.left,x-DX,y+LH); layout(n.right,x+DX,y+LH);} }
+  layout(node,W/2,24);
+  // edges
+  nodes.forEach(e=>{ if(e.n.kind==='join'){ const L=nodes.find(z=>z.n===e.n.left); const R=nodes.find(z=>z.n===e.n.right);
+    for(const c of [L,R]){ const line=document.createElementNS('http://www.w3.org/2000/svg','line'); line.setAttribute('x1',e.x); line.setAttribute('y1',e.y+14); line.setAttribute('x2',c.x); line.setAttribute('y2',c.y-14); line.setAttribute('stroke','#9bb4d3'); line.setAttribute('stroke-width','1.5'); svg.appendChild(line);} }
+  });
+  // nodes
+  nodes.forEach(e=>{
+    const rect=document.createElementNS('http://www.w3.org/2000/svg','rect'); rect.setAttribute('x',e.x-70); rect.setAttribute('y',e.y-16); rect.setAttribute('width',140); rect.setAttribute('height',32); rect.setAttribute('rx','8'); rect.setAttribute('fill', e.n.kind==='join'? 'var(--join)':'var(--scan)'); rect.setAttribute('stroke', e.n.kind==='join'? 'var(--join-br)':'var(--scan-br)'); svg.appendChild(rect);
+    const t1=document.createElementNS('http://www.w3.org/2000/svg','text'); t1.setAttribute('x',e.x); t1.setAttribute('y',e.y-2); t1.setAttribute('text-anchor','middle'); t1.setAttribute('font-size','12px'); t1.setAttribute('fill','var(--ink)'); t1.textContent = e.n.kind==='join' ? `${e.n.op} rows=${e.n.rows}` : `${e.n.method}(${e.n.table}) rows=${e.n.rows}`; svg.appendChild(t1);
+    const t2=document.createElementNS('http://www.w3.org/2000/svg','text'); t2.setAttribute('x',e.x); t2.setAttribute('y',e.y+12); t2.setAttribute('text-anchor','middle'); t2.setAttribute('font-size','11px'); t2.setAttribute('fill','var(--muted)'); t2.textContent = e.n.kind==='join' ? `sel=${e.n.sel.toFixed(4)} cost=${e.n.cost.toFixed(1)}` : `cost=${e.n.cost.toFixed(1)}`; svg.appendChild(t2);
+  });
+}
+
+function renderAll(last){
+  document.getElementById('memoOut').innerHTML = '<pre>'+prettyMemo()+'</pre>';
+  document.getElementById('stepOut').innerHTML = '<pre>'+prettyStep(last)+'</pre>';
+  const full=MEMO_REPLAY.get(FULL_MASK); drawPlanSVG(full?full.node:null);
+}
+
+// ================ UI Wiring =================
+const $ = id=>document.getElementById(id);
+const sql=$('sql'), tables=$('tables'), joins=$('joins'), preds=$('preds');
+$('parse').addEventListener('click', ()=>{
+  const p=parseSQL(sql.value);
+  if(p.tables.length) tables.value=p.tables.map(t=>`${t}:1000:0`).join(',');
+  if(p.joins.length) joins.value=p.joins.map(j=>`${j.l} ${j.r} 0.01`).join('\n');
+  if(p.preds.length) preds.value=p.preds.map(x=>`${x.t} ${x.cond} 0.1`).join('\n');
+});
+
+$('prepare').addEventListener('click', ()=>{
+  const {names,sizes,idx}=parseTables(tables.value);
+  const predMap=parsePreds(preds.value); const joinMap=parseJoins(joins.value);
+  prepareTopDown(names,sizes,idx,predMap,joinMap);
+  // reset replay state
+  CUR=-1; MEMO_REPLAY=new Map(); BEST_WORKING={};
+  $('next').disabled=false; $('prev').disabled=true;
+  stepNext(); // show the very first step (ROOT GOAL)
+});
+
+$('next').addEventListener('click', stepNext);
+$('prev').addEventListener('click', stepPrev);
+$('reset').addEventListener('click', ()=>{
+  sql.value=`SELECT *\nFROM A\nJOIN B ON A.id = B.aid\nJOIN C ON B.id = C.bid\nWHERE A.col1 > 5 AND C.colX = 10;`;
+  tables.value='A:1000:1,B:5000:0,C:2000:1';
+  joins.value='A B 0.01\nB C 0.01';
+  preds.value='A col1>5 0.1\nC colX=10 0.05';
+  $('io').value='1.0'; $('cpu').value='0.1';
+  STEPS=[]; CUR=-1; MEMO_REPLAY=new Map(); BEST_WORKING={};
+  $('next').disabled=true; $('prev').disabled=true;
+  $('memoOut').innerHTML='<pre>(prepare steps)</pre>';
+  $('stepOut').innerHTML='<pre>(prepare steps)</pre>';
+  drawPlanSVG(null);
+});
+
+// Auto-parse once to seed the side inputs
+$('parse').click();
+</script>
+</body>
+</html>
