@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Volcano Top-Down Optimizer — Step by Step</title>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<style>
+body { font-family: Arial, sans-serif; margin:20px; color:#0b1220;}
+h1 { font-size:20px; margin-bottom:8px; }
+.grid { display:grid; grid-template-columns:380px 1fr; gap:16px; }
+.card { background:#fff; padding:12px; border-radius:12px; box-shadow:0 6px 18px rgba(0,0,0,0.06);}
+textarea,input[type=text]{width:100%; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:13px;}
+pre{background:#f7fbff;padding:10px;border-radius:8px;font-size:12.5px;white-space:pre-wrap;border:1px solid #e7f0fb;}
+button{padding:8px 12px;border-radius:8px;background:#0b66ff;color:white;border:none;cursor:pointer;}
+button.alt{background:#eef6ff;color:#03306a;border:1px solid #dbeeff;}
+svg{border:1px solid #e8eef6; margin-top:8px; border-radius:8px; background:white;}
+small.mono{font-family:ui-monospace, SFMono-Regular, Menlo, monospace; color:#5c6b7a;}
+.kv{display:grid;grid-template-columns:140px 1fr; gap:6px;}
+.badge{display:inline-block;padding:2px 6px;border-radius:999px;background:#eef6ff;border:1px solid #dbeeff;color:#03306a;font-size:11px;}
+</style>
+</head>
+<body>
+<h1>Volcano Top-Down Optimizer — Step by Step</h1>
+
+<div class="grid">
+  <div class="card">
+    <label>SQL Query</label>
+    <textarea id="sqlInput" rows="5">SELECT *
+FROM A
+JOIN B ON A.id = B.aid
+JOIN C ON B.id = C.bid
+WHERE A.col1 > 5 AND C.colX = 10;</textarea>
+
+    <label style="margin-top:10px">Table sizes & index (name:rows:index)</label>
+    <input id="tablesInput" type="text" value="A:1000:1,B:5000:0,C:2000:1">
+    <small class="mono">index: 1=yes, 0=no</small>
+
+    <label style="margin-top:10px">Join selectivities (left right sel)</label>
+    <textarea id="joinsInput" rows="3">A B 0.01
+B C 0.01</textarea>
+
+    <label style="margin-top:10px">Predicate selectivities (table cond sel)</label>
+    <textarea id="predicatesInput" rows="3">A col1>5 0.1
+C colX=10 0.05</textarea>
+
+    <label style="margin-top:10px">Cost parameters</label>
+    <div class="kv">
+      <div><small class="mono">IO per row</small></div><input id="ioRow" type="text" value="1.0">
+      <div><small class="mono">CPU per row</small></div><input id="cpuRow" type="text" value="0.1">
+    </div>
+
+    <div style="margin-top:12px; display:flex; gap:8px; flex-wrap:wrap;">
+      <button id="parseBtn" class="alt">Parse Query</button>
+      <button id="prepareBtn">Prepare Steps</button>
+      <button id="prevBtn" class="alt">Previous</button>
+      <button id="nextBtn">Next</button>
+      <button id="resetBtn" class="alt">Reset</button>
+    </div>
+    <div style="margin-top:8px">
+      <span class="badge">Top-down</span> <span class="badge">Memoized</span> <span class="badge">Step-by-step</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <label>Memo table (solved goals)</label>
+    <div id="memoOut"><pre>(prepare steps)</pre></div>
+
+    <label style="margin-top:10px">Step</label>
+    <div id="stepOut"><pre>(prepare steps)</pre></div>
+
+    <label style="margin-top:10px">Best plan (SVG)</label>
+    <div id="svgContainer"><svg id="planSvg" width="100%" height="420"></svg></div>
+  </div>
+</div>
+
+<script>
+// ============= Utilities & Parsing =============
+function keyPair(a,b){return a<b?`${a}|${b}`:`${b}|${a}`;}
+function parseTables(input){
+  const names=[], sizes={}, indexes={};
+  input.split(",").map(s=>s.trim()).filter(Boolean).forEach(p=>{
+    const [n,r,i]=p.split(":").map(x=>x.trim());
+    if(!n) return; names.push(n); sizes[n]=parseInt(r||"1000",10); indexes[n]=(i==="1");
+  });
+  return {names,sizes,indexes};
+}
+function parsePredicates(lines){
+  const m=new Map();
+  lines.split("\n").map(l=>l.trim()).filter(Boolean).forEach(r=>{
+    const parts=r.split(/\s+/); if(parts.length<3) return;
+    const t=parts[0], sel=parseFloat(parts[parts.length-1]); m.set(t, isNaN(sel)?1.0:sel);
+  });
+  return m;
+}
+function parseJoins(lines){
+  const m=new Map();
+  lines.split("\n").map(l=>l.trim()).filter(Boolean).forEach(r=>{
+    const [a,b,s]=r.split(/\s+/); const sel=parseFloat(s);
+    if(a && b && !isNaN(sel)) m.set(keyPair(a,b), sel);
+  });
+  return m;
+}
+function parseSQL(sql){
+  const tables=[], joins=[], preds=[];
+  const from = sql.match(/FROM\s+([a-zA-Z_][\w]*)/i); if(from) tables.push(from[1]);
+  const jre=/JOIN\s+([a-zA-Z_][\w]*)\s+ON\s+([a-zA-Z_][\w]*)\.[^\s=]+=\s*([a-zA-Z_][\w]*)\.[^\s)]+/ig;
+  let m; while((m=jre.exec(sql))){
+    const t=m[1]; if(!tables.includes(t)) tables.push(t);
+    joins.push({l:m[2], r:m[3]});
+  }
+  const where = sql.match(/WHERE\s+(.+)/i);
+  if(where){
+    where[1].split(/AND/i).map(s=>s.trim()).filter(Boolean).forEach(c=>{
+      const t=c.split(".")[0].trim();
+      preds.push({t, cond:c, sel:0.1}); // default 0.1; user can edit below
+    });
+  }
+  return {tables,joins,preds};
+}
+
+// ============= Cost Model & Estimation =============
+function getParams(){ return {io:parseFloat(ioRow.value)||1.0, cpu:parseFloat(cpuRow.value)||0.1}; }
+function costScan(rows, params, method){ return method==="IndexScan" ? rows*params.cpu : rows*params.io; }
+function costHashJoin(L,R,params){ return L.cost + R.cost + (L.rows + R.rows)*params.cpu; }
+function costNLJ(L,R,params){ return L.cost + R.cost + (L.rows*R.rows)*params.cpu; }
+
+function computeCutSel(leftNames, rightNames, joinMap){
+  const sels=[];
+  for(const a of leftNames) for(const b of rightNames){
+    const k=keyPair(a,b); if(joinMap.has(k)) sels.push(joinMap.get(k));
+  }
+  return sels.length? sels.reduce((a,b)=>a*b,1.0) : 0.1; // default if no join predicate
+}
+
+// ============= Plan Nodes =============
+function ScanNode(table, rows, cost, method){
+  return { kind:"scan", table, rows, cost, method,
+    toString(indent=0){const pad=" ".repeat(indent); return `${pad}${method}(${table}) rows=${rows} cost=${cost.toFixed(2)}`;}
+  };
+}
+function JoinNode(op, left, right, sel, rows, cost){
+  return { kind:"join", op, left, right, sel, rows, cost,
+    toString(indent=0){
+      const pad=" ".repeat(indent);
+      return `${pad}${op} sel=${sel.toFixed(4)} rows=${rows} cost=${cost.toFixed(2)}\n`
+           + left.toString(indent+2) + "\n" + right.toString(indent+2);
+    }
+  };
+}
+
+// ============= Top-Down Volcano Search with Memo (Step Recorder) =============
+// We generate a *sequence of steps* following a DFS top-down search order.
+// During replay, we rebuild the memo in the same order.
+let STEPS=[], MEMO_REPLAY=new Map(), BEST_WORKING={}, CUR=-1, FULL_MASK=0, IDX2NAME=[], NAME2IDX={};
+
+function popcount(x){let c=0;while(x){c+=x&1;x>>=1;}return c;}
+function maskToNames(mask){const arr=[]; for(let i=0;i<IDX2NAME.length;i++) if(mask&(1<<i)) arr.push(IDX2NAME[i]); return arr;}
+function properSubmasksUnique(mask){
+  // Generate unique (L,R) splits with L < R in integer value to avoid symmetric duplicates
+  const outs=[];
+  for(let sub=((mask-1)&mask); sub; sub=((sub-1)&mask)){
+    const other = mask ^ sub;
+    if(other===0) continue;
+    if(sub < other) outs.push([sub, other]);
+  }
+  return outs;
+}
+
+function prepareTopDownSteps(tables, sizes, indexes, predMap, joinMap, params){
+  // init globals
+  IDX2NAME = tables.slice();
+  NAME2IDX = {}; tables.forEach((t,i)=>NAME2IDX[t]=i);
+  MEMO_REPLAY = new Map();
+  BEST_WORKING = {}; // per-goal working best while replaying
+  STEPS = [];
+  CUR = -1;
+  FULL_MASK = (1<<tables.length) - 1;
+
+  // record base-scan creation lazily when encountered
+  function buildBase(mask){
+    const i = Math.log2(mask)|0;
+    const t = IDX2NAME[i];
+    const sel = predMap.get(t) ?? 1.0;
+    const method = indexes[t] ? "IndexScan" : "SeqScan";
+    const outRows = Math.max(1, Math.floor((sizes[t]||1000) * sel));
+    const cost = costScan(outRows, params, method);
+    const node = ScanNode(t, outRows, cost, method);
+    return { rows: outRows, cost, node, repr: t };
+  }
+
+  // The actual top-down search (DFS), but we only *record* steps
+  const MEMO_GEN = new Map();
+
+  function chooseBest(mask){
+    // If memoized, emit memo-hit step and return
+    if(MEMO_GEN.has(mask)){
+      STEPS.push({type:"memo_hit", mask});
+      return MEMO_GEN.get(mask);
+    }
+
+    // Expand this goal
+    STEPS.push({type:"expand_goal", mask});
+
+    // Base case
+    if(popcount(mask)===1){
+      const plan = buildBase(mask);
+      MEMO_GEN.set(mask, plan);
+      STEPS.push({type:"base_scan", mask, plan});
+      STEPS.push({type:"memoize", mask, plan});
+      return plan;
+    }
+
+    // Try splits
+    let best=null;
+    const splits = properSubmasksUnique(mask);
+    for(const [L,R] of splits){
+      STEPS.push({type:"consider_split", mask, L, R});
+
+      const planL = chooseBest(L);   // recurse
+      const planR = chooseBest(R);   // recurse
+
+      // cost two physical joins
+      const leftNames  = maskToNames(L);
+      const rightNames = maskToNames(R);
+      const sel = computeCutSel(leftNames, rightNames, joinMap);
+      const outRows = Math.max(1, Math.floor(planL.rows * planR.rows * sel));
+      const hcost = costHashJoin(planL, planR, params);
+      const ncost = costNLJ(planL, planR, params);
+
+      // record both candidates as steps
+      STEPS.push({type:"cost_candidate", mask, L, R, op:"HashJoin", sel, outRows, cost:hcost});
+      STEPS.push({type:"cost_candidate", mask, L, R, op:"NestedLoop", sel, outRows, cost:ncost});
+
+      const op = (hcost <= ncost) ? "HashJoin" : "NestedLoop";
+      const cst = Math.min(hcost, ncost);
+      const cand = { rows: outRows, cost: cst, node: JoinNode(op, planL.node, planR.node, sel, outRows, cst), repr:`(${planL.repr} ⋈ ${planR.repr})` };
+
+      if(!best || cand.cost < best.cost){
+        best = cand;
+        STEPS.push({type:"update_best", mask, best});
+      }
+    }
+    MEMO_GEN.set(mask, best);
+    STEPS.push({type:"memoize", mask, plan:best});
+    return best;
+  }
+
+  // Kick off with the full goal
+  chooseBest(FULL_MASK);
+}
+
+// ============= Replay Engine (apply steps one-by-one) =============
+function applyStep(idx){
+  CUR = idx;
+  const step = STEPS[CUR];
+  if(!step){ renderAll(); return; }
+
+  switch(step.type){
+    case "expand_goal": {
+      // initialize working best for this goal (for display)
+      if(!(step.mask in BEST_WORKING)) BEST_WORKING[step.mask] = null;
+      break;
+    }
+    case "base_scan": {
+      // Base plan becomes best working immediately
+      BEST_WORKING[step.mask] = step.plan;
+      break;
+    }
+    case "consider_split": {
+      // purely informative
+      break;
+    }
+    case "cost_candidate": {
+      // informative; used by UI
+      break;
+    }
+    case "update_best": {
+      BEST_WORKING[step.mask] = step.best;
+      break;
+    }
+    case "memoize": {
+      MEMO_REPLAY.set(step.mask, step.plan);
+      break;
+    }
+    case "memo_hit": {
+      // nothing to compute; memo already has it from prior memoize in this order
+      break;
+    }
+  }
+  renderAll(step);
+}
+
+function renderAll(lastStep){
+  // Memo table
+  memoOut.innerHTML = "<pre>"+prettyMemo()+"</pre>";
+
+  // Step text
+  stepOut.innerHTML = "<pre>"+prettyStep(lastStep)+"</pre>";
+
+  // Plan SVG: if full goal memoized, draw; else draw placeholder
+  const full = MEMO_REPLAY.get(FULL_MASK);
+  drawPlanSVG(full ? full.node : null);
+}
+
+function prettyMask(mask){
+  return mask.toString(2).padStart(IDX2NAME.length,'0')+" ("+maskToNames(mask).join(",")+")";
+}
+function prettyMemo(){
+  const lines = ["mask | tables | cost | rows | repr"];
+  const N = 1<<IDX2NAME.length;
+  for(let m=1;m<N;m++){
+    const entry = MEMO_REPLAY.get(m) || BEST_WORKING[m];
+    const names = maskToNames(m).join(",");
+    if(entry){
+      lines.push(`${m.toString(2).padStart(IDX2NAME.length,'0')} | ${names} | ${entry.cost.toFixed(2)} | ${entry.rows} | ${entry.repr}`);
+    } else {
+      lines.push(`${m.toString(2).padStart(IDX2NAME.length,'0')} | ${names} | - | - | -`);
+    }
+  }
+  return lines.join("\n");
+}
+function prettyStep(s){
+  if(!s) return "(ready)";
+  switch(s.type){
+    case "expand_goal":    return `Expand goal: ${prettyMask(s.mask)}`;
+    case "memo_hit":       return `Memo hit: ${prettyMask(s.mask)}`;
+    case "base_scan":      return `Base scan: ${prettyMask(s.mask)}  → ${s.plan.node.method}(${s.plan.repr}) rows=${s.plan.rows} cost=${s.plan.cost.toFixed(2)}`;
+    case "consider_split": return `Consider split for ${prettyMask(s.mask)}:\n  L=${prettyMask(s.L)}\n  R=${prettyMask(s.R)}`;
+    case "cost_candidate": return `Cost candidate for ${prettyMask(s.mask)} via ${s.op}:\n  sel=${s.sel.toFixed(6)} rows=${s.outRows} cost=${s.cost.toFixed(2)}\n  (children L=${prettyMask(s.L)} , R=${prettyMask(s.R)})`;
+    case "update_best":    return `Update best for ${prettyMask(s.mask)}:\n  cost=${s.best.cost.toFixed(2)} rows=${s.best.rows} repr=${s.best.repr}`;
+    case "memoize":        return `Memoize ${prettyMask(s.mask)}  ✅\n  best cost=${s.plan.cost.toFixed(2)} rows=${s.plan.rows} repr=${s.plan.repr}`;
+    default: return JSON.stringify(s,null,2);
+  }
+}
+
+// ============= SVG Drawing =============
+function drawPlanSVG(node){
+  const svg = document.getElementById("planSvg");
+  while(svg.firstChild) svg.removeChild(svg.firstChild);
+  const W = svg.clientWidth || 700, H = 420, LH = 70, DX = 120;
+  svg.setAttribute("height", H);
+
+  if(!node){
+    const t=document.createElementNS("http://www.w3.org/2000/svg","text");
+    t.setAttribute("x", 16); t.setAttribute("y", 24); t.textContent = "(no full plan yet)";
+    t.setAttribute("fill","#6b7785"); t.setAttribute("font-size","12px");
+    svg.appendChild(t);
+    return;
+  }
+
+  const nodes=[];
+  function layout(n,x,y){
+    nodes.push({n,x,y});
+    if(n.kind==="join"){
+      layout(n.left,  x-DX, y+LH);
+      layout(n.right, x+DX, y+LH);
+    }
+  }
+  layout(node, W/2, 24);
+
+  // edges
+  nodes.forEach(e=>{
+    if(e.n.kind==="join"){
+      const L=nodes.find(z=>z.n===e.n.left);
+      const R=nodes.find(z=>z.n===e.n.right);
+      for(const child of [L,R]){
+        const line=document.createElementNS("http://www.w3.org/2000/svg","line");
+        line.setAttribute("x1", e.x); line.setAttribute("y1", e.y+14);
+        line.setAttribute("x2", child.x); line.setAttribute("y2", child.y-14);
+        line.setAttribute("stroke", "#9bb4d3"); line.setAttribute("stroke-width","1.5");
+        svg.appendChild(line);
+      }
+    }
+  });
+
+  // nodes
+  nodes.forEach(e=>{
+    const rect=document.createElementNS("http://www.w3.org/2000/svg","rect");
+    rect.setAttribute("x", e.x-70); rect.setAttribute("y", e.y-16);
+    rect.setAttribute("width", 140); rect.setAttribute("height", 32);
+    rect.setAttribute("rx","8"); rect.setAttribute("fill", e.n.kind==="join" ? "#e9f3ff" : "#fff8e6");
+    rect.setAttribute("stroke", e.n.kind==="join" ? "#79a6f6" : "#f2c46b");
+    svg.appendChild(rect);
+
+    const text=document.createElementNS("http://www.w3.org/2000/svg","text");
+    text.setAttribute("x", e.x); text.setAttribute("y", e.y-2);
+    text.setAttribute("text-anchor","middle"); text.setAttribute("font-size","12px"); text.setAttribute("fill","#0b1220");
+    text.textContent = e.n.kind==="join" ? `${e.n.op} rows=${e.n.rows}` : `${e.n.method}(${e.n.table}) rows=${e.n.rows}`;
+    svg.appendChild(text);
+
+    const text2=document.createElementNS("http://www.w3.org/2000/svg","text");
+    text2.setAttribute("x", e.x); text2.setAttribute("y", e.y+12);
+    text2.setAttribute("text-anchor","middle"); text2.setAttribute("font-size","11px"); text2.setAttribute("fill","#4b5b6c");
+    text2.textContent = e.n.kind==="join" ? `sel=${e.n.sel.toFixed(4)} cost=${e.n.cost.toFixed(1)}` : `cost=${e.n.cost.toFixed(1)}`;
+    svg.appendChild(text2);
+  });
+}
+
+// ============= Wiring & Controls =============
+const sqlInput = document.getElementById('sqlInput');
+const tablesInput = document.getElementById('tablesInput');
+const joinsInput = document.getElementById('joinsInput');
+const predicatesInput = document.getElementById('predicatesInput');
+const ioRow = document.getElementById('ioRow');
+const cpuRow = document.getElementById('cpuRow');
+
+const parseBtn = document.getElementById('parseBtn');
+const prepareBtn = document.getElementById('prepareBtn');
+const nextBtn = document.getElementById('nextBtn');
+const prevBtn = document.getElementById('prevBtn');
+const resetBtn = document.getElementById('resetBtn');
+
+const memoOut = document.getElementById('memoOut');
+const stepOut = document.getElementById('stepOut');
+
+parseBtn.addEventListener('click', ()=>{
+  const parsed = parseSQL(sqlInput.value);
+  if(parsed.tables.length){
+    tablesInput.value = parsed.tables.map(t=>`${t}:1000:0`).join(",");
+  }
+  if(parsed.joins.length){
+    joinsInput.value = parsed.joins.map(j=>`${j.l} ${j.r} 0.01`).join("\n");
+  }
+  if(parsed.preds.length){
+    predicatesInput.value = parsed.preds.map(p=>`${p.t} ${p.cond} 0.1`).join("\n");
+  }
+});
+
+prepareBtn.addEventListener('click', ()=>{
+  const {names,sizes,indexes} = parseTables(tablesInput.value);
+  const predMap = parsePredicates(predicatesInput.value);
+  const joinMap = parseJoins(joinsInput.value);
+  const params = getParams();
+
+  // Build and record a true Volcano top-down step sequence
+  prepareTopDownSteps(names, sizes, indexes, predMap, joinMap, params);
+
+  // Reset replay state
+  MEMO_REPLAY = new Map();
+  BEST_WORKING = {};
+  CUR = -1;
+  // Step to first
+  stepNext();
+});
+
+nextBtn.addEventListener('click', stepNext);
+prevBtn.addEventListener('click', stepPrev);
+resetBtn.addEventListener('click', ()=>{
+  sqlInput.value = `SELECT *
+FROM A
+JOIN B ON A.id = B.aid
+JOIN C ON B.id = C.bid
+WHERE A.col1 > 5 AND C.colX = 10;`;
+  tablesInput.value = "A:1000:1,B:5000:0,C:2000:1";
+  joinsInput.value = "A B 0.01\nB C 0.01";
+  predicatesInput.value = "A col1>5 0.1\nC colX=10 0.05";
+  ioRow.value = "1.0"; cpuRow.value = "0.1";
+  MEMO_REPLAY = new Map(); BEST_WORKING={}; STEPS=[]; CUR=-1;
+  memoOut.innerHTML = "<pre>(prepare steps)</pre>";
+  stepOut.innerHTML = "<pre>(prepare steps)</pre>";
+  drawPlanSVG(null);
+});
+
+function stepNext(){
+  if(CUR < STEPS.length-1){
+    applyStep(CUR+1);
+  }
+}
+function stepPrev(){
+  if(CUR > -1){
+    // Rebuild from scratch up to CUR-1
+    const target = CUR-1;
+    MEMO_REPLAY = new Map(); BEST_WORKING={};
+    const old = CUR;
+    CUR = -1;
+    for(let i=0;i<=target;i++) applyStep(i);
+    if(target<0) renderAll();
+    else applyStep(target);
+  }
+}
+
+// Initial parse & prepare
+document.getElementById('parseBtn').click();
+</script>
+</body>
+</html>
