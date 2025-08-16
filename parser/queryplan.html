@@ -64,6 +64,66 @@ function buildLogicalPlan(node, alias=null) {
     return { name: label, children: [current] };
   }
 }
+function renderTree(planTree) {
+  const svg = d3.select("svg");
+  svg.selectAll("*").remove();
+
+  const g = svg.append("g").attr("transform", "translate(50,50)");
+  const treeLayout = d3.tree().size([1000, 500]);
+  const root = d3.hierarchy(planTree);
+  treeLayout(root);
+
+  // links
+  g.selectAll(".link")
+    .data(root.links())
+    .enter()
+    .append("path")
+    .attr("class","link")
+    .attr("d", d3.linkVertical()
+      .x(d=>d.x)
+      .y(d=>d.y)
+    );
+
+  // nodes
+  const node = g.selectAll(".node")
+    .data(root.descendants())
+    .enter()
+    .append("g")
+    .attr("class","node")
+    .attr("transform", d=>`translate(${d.x},${d.y})`);
+
+  // compute dynamic width based on text length
+  node.each(function(d) {
+    const text = d.data.name;
+    // approximate width per character (adjust multiplier as needed)
+    const w = Math.max(40, text.length * 9); 
+    const h = 30;
+
+    // background rectangle
+    d3.select(this)
+      .append("rect")
+      .attr("x", -w/2)
+      .attr("y", -h/2)
+      .attr("width", w)
+      .attr("height", h)
+      .attr("rx", 10).attr("ry", 10) // rounded corners
+      .style("fill", "#f8f9fa")
+      .style("stroke", "#333")
+      .style("stroke-width", 2);
+
+    // text
+    d3.select(this)
+      .append("foreignObject")
+      .attr("x", -w/2).attr("y", -h/2)
+      .attr("width", w).attr("height", h)
+      .append("xhtml:div")
+      .html(text)
+      .style("text-align","center")
+      .style("font-family","Times New Roman")
+      .style("font-size","16px")
+      .style("line-height", h+"px"); // vertical centering
+  });
+}
 
 function buildFrom(fromNode) {
   const items = fromNode.items;
@@ -94,7 +154,7 @@ function algebraExpr(node) {
 }
 
 // --- D3 Tree rendering ---
-function renderTree(planTree) {
+function renderTree1(planTree) {
   const svg = d3.select("svg");
   svg.selectAll("*").remove();
 
