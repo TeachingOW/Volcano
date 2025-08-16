@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Relational Algebra Tree with Subscripts</title>
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<style>
+  body { font-family: sans-serif; margin: 20px; }
+  textarea { width: 900px; height: 200px; font-family: monospace; font-size: 14px; }
+  button { margin: 5px; padding: 5px 10px; }
+  #exprBox {
+    font-family: "Times New Roman", serif;
+    font-size: 18px;
+    margin: 10px 0;
+    padding: 8px;
+    background: #f9f9f9;
+    border: 1px solid #ccc;
+    display: inline-block;
+  }
+  .node circle {
+    fill: #f8f9fa;
+    stroke: #333;
+    stroke-width: 2px;
+  }
+  .node div {
+    font-family: "Times New Roman", serif;
+    font-size: 16px;
+    text-align: center;
+  }
+  .link {
+    fill: none;
+    stroke: #555;
+    stroke-opacity: 0.6;
+    stroke-width: 2px;
+  }
+</style>
+</head>
+<body>
+<h2>Interactive Relational Algebra Tree (Subscripts, No Scan)</h2>
+
+<textarea id="inputJson"></textarea><br>
+<button id="btnBuild">Build Tree</button>
+<div id="exprBox"></div>
+<br>
+<svg width="1100" height="600"></svg>
+
+<script>
+function buildLogicalPlan(node, alias=null) {
+  if (node.type === "Select") {
+    let current = buildFrom(node.from);
+
+    if (node.where) {
+      const cond = `${node.where.left.parts.join(".")}=${node.where.right.parts.join(".")}`;
+      //current = { name: `σ_{${cond}}`, children: [current] };
+     current = { name: `σ<sub>${cond}</sub>`, children: [current] };
+    }
+
+    const cols = node.columns.items.map(c =>
+      c.type === "Star" ? "*" : c.parts.join(".")
+    );
+
+    //const label = alias ? `π_{${cols.join(",")}} [${alias}]` : `π_{${cols.join(",")}}`;
+     const label = alias ? `π<sub>${cols.join(", ")}</sub> [${alias}]` : `π<sub>${cols.join(", ")}</sub>`;
+    return { name: label, children: [current] };
+  }
+}
+
+function buildFrom(fromNode) {
+  const items = fromNode.items;
+  if (items.length === 1) return buildTableOrSubquery(items[0]);
+  if (items.length === 2) {
+    const left = buildTableOrSubquery(items[0]);
+    const right = buildTableOrSubquery(items[1]);
+    return { name: "⋈", children: [left, right] };
+  }
+}
+
+function buildTableOrSubquery(item) {
+  if (item.type === "Table") return { name: item.name };
+  if (item.type === "Subquery") return buildLogicalPlan(item.select, item.alias);
+}
+
+// --- Generate linear relational algebra expression with subscripts ---
+function algebraExpr(node) {
+  if (!node) return "";
+  const text = node.name;
+  if (!node.children || node.children.length === 0) return text;
+
+  const childExprs = node.children.map(c => algebraExpr(c));
+  if (text.startsWith("π")) return `${text}[${childExprs[0]}]`;
+  if (text.startsWith("σ")) return `${text}(${childExprs[0]})`;
+  if (text === "⋈") return `(${childExprs[0]}) ⋈ (${childExprs[1]})`;
+  return text;
+}
+
+// --- D3 Tree rendering ---
+function renderTree(planTree) {
+  const svg = d3.select("svg");
+  svg.selectAll("*").remove();
+
+  const g = svg.append("g").attr("transform", "translate(50,50)");
+  const treeLayout = d3.tree().size([1000, 500]);
+  const root = d3.hierarchy(planTree);
+  treeLayout(root);
+
+  // links
+  g.selectAll(".link")
+    .data(root.links())
+    .enter()
+    .append("path")
+    .attr("class","link")
+    .attr("d", d3.linkVertical()
+      .x(d=>d.x)
+      .y(d=>d.y)
+    );
+
+  // nodes
+  const node = g.selectAll(".node")
+    .data(root.descendants())
+    .enter()
+    .append("g")
+    .attr("class","node")
+    .attr("transform", d=>`translate(${d.x},${d.y})`);
+
+  node.append("circle").attr("r", 20);
+
+  node.append("foreignObject")
+    .attr("x", -60).attr("y", -20)
+    .attr("width", 120).attr("height", 40)
+    .append("xhtml:div")
+    .html(d=>d.data.name)
+    .style("text-align","center")
+    .style("font-family","Times New Roman")
+    .style("font-size","16px");
+}
+
+// --- Button ---
+document.getElementById("btnBuild").onclick = () => {
+  try {
+    const raw = document.getElementById("inputJson").value;
+    const parsed = JSON.parse(raw);
+    const planTree = buildLogicalPlan(parsed);
+    renderTree(planTree);
+    //console.log(planTree);
+    console.log(algebraExpr(planTree));
+    document.getElementById("exprBox").innerHTML = algebraExpr(planTree);
+  } catch(e) {
+    alert("Invalid JSON: "+e.message);
+  }
+};
+
+// --- Example JSON ---
+document.getElementById("inputJson").value = JSON.stringify({
+  "type": "Select",
+  "columns": {
+    "type": "Columns",
+    "items": [
+      { "type": "ColumnRef", "parts": ["a","d"] },
+      { "type": "ColumnRef", "parts": ["b","e"] }
+    ]
+  },
+  "from": {
+    "type": "From",
+    "items": [
+      { "type": "Table", "name": "A" },
+      {
+        "type": "Subquery",
+        "select": {
+          "type": "Select",
+          "columns": { "type": "Columns", "items": [{ "type": "Star" }] },
+          "from": { "type": "From", "items": [{ "type": "Table", "name": "C"}] },
+          "where": null
+        },
+        "alias": "B"
+      }
+    ]
+  },
+  "where": {
+    "type": "Compare",
+    "left": { "type": "ColumnRef", "parts": ["a","x"] },
+    "op": "=",
+    "right": { "type": "ColumnRef", "parts": ["B","d"] }
+  }
+}, null, 2);
+</script>
+</body>
+</html>
