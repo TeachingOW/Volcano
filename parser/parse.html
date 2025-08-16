@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MySQL SQL Parser (Nearley + Moo) – Fixed</title>
+  <style>
+    :root { --bg:#0f172a; --panel:#111827; --muted:#94a3b8; --text:#e5e7eb; --accent:#38bdf8; --ok:#10b981; --err:#ef4444; --shadow:0 10px 30px rgba(0,0,0,.35);} 
+    html,body{height:100%}
+    body{margin:0;font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,"Helvetica Neue",Arial;background:linear-gradient(135deg,#0b1023,var(--bg));color:var(--text)}
+    header{padding:18px 22px;display:flex;align-items:center;gap:12px}
+    header .tag{background:rgba(56,189,248,.15);border:1px solid rgba(56,189,248,.5);color:var(--accent);padding:2px 8px;border-radius:999px}
+    .wrap{display:grid;grid-template-columns:1.2fr 1fr;gap:16px;padding:0 16px 16px}
+    .card{background:var(--panel);border:1px solid rgba(255,255,255,.06);border-radius:16px;box-shadow:var(--shadow);overflow:hidden}
+    .card h2{margin:0;font-size:13px;letter-spacing:.4px;text-transform:uppercase;color:var(--muted);padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.06);display:flex;align-items:center;justify-content:space-between}
+    .card .body{padding:12px}
+    textarea{width:100%;resize:vertical;min-height:140px;max-height:60vh;background:#0b1224;color:var(--text);border:1px solid rgba(255,255,255,.1);border-radius:12px;padding:12px;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace}
+    .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    button{background:var(--accent);color:#001018;border:0;padding:10px 14px;border-radius:12px;cursor:pointer;font-weight:700;box-shadow:0 8px 16px rgba(56,189,248,.25)}
+    button.secondary{background:transparent;color:var(--muted);border:1px solid rgba(255,255,255,.14)}
+    pre.json{background:#0b1224;border:1px solid rgba(255,255,255,.1);padding:12px;border-radius:12px;overflow:auto;max-height:60vh}
+    .tree{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;font-size:13px}
+    .tree ul{list-style:none;padding-left:16px;margin:2px 0;border-left:1px dashed rgba(148,163,184,.3)}
+    .tree li{margin:2px 0}
+    .node{display:flex;gap:8px;align-items:center}
+    .badge{font-size:11px;background:rgba(56,189,248,.15);color:var(--accent);border:1px solid rgba(56,189,248,.35);padding:2px 6px;border-radius:999px}
+    .key{color:#cbd5e1}
+    .muted{color:var(--muted)}
+    .ok{color:var(--ok)}
+    .err{color:var(--err)}
+  </style>
+</head>
+<body>
+  <header>
+    <span class="tag">Nearley + Moo</span>
+    <h1>MySQL SQL Parser → Parse Tree (JSON + Visual)</h1>
+  </header>
+
+  <div class="wrap">
+    <div class="card">
+      <h2>Input SQL <span class="muted">Supports comments, SELECT, comma joins, JOIN ... ON, subqueries in FROM, WHERE, GROUP BY, ORDER BY</span></h2>
+      <div class="body">
+        <textarea id="sql" spellcheck="false">-- Try a few
+select * from A;
+
+SELECT * from A, B where A.x=B.y;
+
+SELECT * from A, (select * from C) B where a.x=B.d;
+</textarea>
+        <div class="row" style="margin-top:8px;">
+          <button id="parseBtn">Parse SQL</button>
+          <button id="clearBtn" class="secondary">Clear Output</button>
+          <span id="status" class="muted"></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>JSON Parse Tree</h2>
+      <div class="body"><pre id="json" class="json">(empty)</pre></div>
+    </div>
+
+    <div class="card" style="grid-column:1 / -1;">
+      <h2>Visual Tree</h2>
+      <div class="body"><div id="tree" class="tree muted">(empty)</div></div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/moo@0.5.2/moo.js"></script>
+  <script src="https://unpkg.com/nearley@2.20.1/lib/nearley.js"></script>
+
+  <script>
+  // --- Robust comment stripper (MySQL-style)
+  function stripComments(sql) {
+    return sql
+      // block /* ... */
+      .replace(/\/\*[\s\S]*?\*\//g, ' ')
+      // line -- ... and # ...
+      .replace(/--[^\n]*$/gm, '')
+      .replace(/#[^\n]*$/gm, '');
+  }
+
+  // --- Lexer (Moo)
+  function makeLexer() {
+    const base = moo.compile({
+      ws:      { match: /[\t\n\r\v\f ]+/, lineBreaks: true },
+      number:  /(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?/,
+      string:  { match: /'(?:''|\\'|[^'])*'/, value: s => s.slice(1, -1).replace(/''/g, "'") },
+      lparen:  '(' ,
+      rparen:  ')',
+      comma:   ',',
+      dot:     '.',
+      star:    '*',
+      semicolon: /;/,
+      op:      /<=|>=|<>|!=|=|<|>|\+|\-|\*|\/|%/,
+      identifier: { match: /[A-Za-z_][A-Za-z0-9_$]*/, value: s => s },
+      backtickIdent: { match: /`[^`]+`/, value: s => s.slice(1, -1) },
+    });
+
+    const KEYWORDS = new Set([
+      'select','from','where','as','join','inner','left','right','full','outer','on','group','by','order','asc','desc','having','union','all',
+      'and','or','not','is','null','like','in','between'
+    ]);
+
+    const wrapper = {
+      reset: (chunk, info) => base.reset(chunk, info),
+      next: () => {
+        let t;
+        while ((t = base.next())) {
+          if (t.type === 'ws') continue; // skip whitespace
+          if (t.type === 'identifier') {
+            const lower = t.value.toLowerCase();
+            if (KEYWORDS.has(lower)) return { ...t, type: lower };
+            return t;
+          }
+          return t;
+        }
+        return t;
+      },
+      save: () => base.save(),
+      formatError: (token, message) => base.formatError(token, message),
+      has: (tokenType) => base.has(tokenType)
+    };
+    return wrapper;
+  }
+
+  // --- AST helpers
+  const node = (type, props = {}) => ({ type, ...props });
+  const list = (type, items) => node(type, { items });
+
+  // --- Nearley grammar (programmatic) for a practical MySQL SELECT subset
+  function makeGrammar() {
+  const lexer = makeLexer();
+
+  // small helpers
+  const node = (type, props = {}) => Object.assign({ type }, props);
+  const list = (type, items) => Object.assign({ type, items });
+
+  return {
+    Lexer: lexer,
+    ParserRules: [
+      // main -> select_stmt [ ; ]
+      { name: 'main', symbols: ['SelectStmt'], postprocess: d => d[0] },
+      { name: 'main', symbols: ['SelectStmt', { type: 'semicolon' }], postprocess: d => d[0] },
+
+      // SelectStmt -> select SelectList from FromClause [where/group/order]
+      { name: 'SelectStmt$ebnf$1', symbols: ['WhereOpt'], postprocess: id => id[0] || null },
+      { name: 'SelectStmt$ebnf$1', symbols: [], postprocess: () => null },
+      {
+        name: 'SelectStmt',
+        symbols: [{ type: 'select' }, 'SelectList', { type: 'from' }, 'FromClause', 'SelectStmt$ebnf$1'],
+        postprocess: d => node('Select', { columns: d[1], from: d[3], where: d[4] })
+      },
+
+      // SelectList -> * | identifier list
+      { name: 'SelectList', symbols: [{ type: 'star' }], postprocess: () => list('Columns', [node('Star')]) },
+      { name: 'SelectList', symbols: ['ExprList'], postprocess: d => list('Columns', d[0].items) },
+
+      // ExprList -> expr ( , expr )*
+      { name: 'ExprList$ebnf$1', symbols: [] },
+      { name: 'ExprList$ebnf$1$subexpr$1', symbols: [{ type: 'comma' }, 'ValueExpr'] },
+      {
+        name: 'ExprList$ebnf$1',
+        symbols: ['ExprList$ebnf$1', 'ExprList$ebnf$1$subexpr$1'],
+        postprocess: d => d[0].concat([d[1]])
+      },
+      {
+        name: 'ExprList',
+        symbols: ['ValueExpr', 'ExprList$ebnf$1'],
+        postprocess: d => list('ExprList', [d[0]].concat(d[1].map(x => x[1])))
+      },
+
+      // ValueExpr -> ColumnRef | literal | (ValueExpr)
+      { name: 'ValueExpr', symbols: ['ColumnRef'], postprocess: d => d[0] },
+      { name: 'ValueExpr', symbols: ['Literal'], postprocess: d => d[0] },
+      { name: 'ValueExpr', symbols: [{ type: 'lparen' }, 'ValueExpr', { type: 'rparen' }], postprocess: d => d[1] },
+
+      // ColumnRef -> identifier ( . identifier )*
+      { name: 'ColumnRef$ebnf$1', symbols: [] },
+      { name: 'ColumnRef$ebnf$1$subexpr$1', symbols: [{ type: 'dot' }, { type: 'identifier' }] },
+      {
+        name: 'ColumnRef$ebnf$1',
+        symbols: ['ColumnRef$ebnf$1', 'ColumnRef$ebnf$1$subexpr$1'],
+        postprocess: d => d[0].concat([d[1]])
+      },
+      {
+        name: 'ColumnRef',
+        symbols: [{ type: 'identifier' }, 'ColumnRef$ebnf$1'],
+        postprocess: d => node('ColumnRef', { parts: [d[0].value].concat(d[1].map(x => x[1].value)) })
+      },
+
+      // Literal -> number|string
+      {
+        name: 'Literal',
+        symbols: [{ type: 'number' }],
+        postprocess: d => node('Number', { value: Number(d[0].value) })
+      },
+      {
+        name: 'Literal',
+        symbols: [{ type: 'string' }],
+        postprocess: d => node('String', { value: d[0].value.slice(1, -1).replace(/''/g, "'") })
+      },
+
+      // FromClause -> TableSourceList
+      { name: 'FromClause', symbols: ['TableSourceList'], postprocess: d => list('From', d[0]) },
+
+      // TableSourceList -> TableSource ( , TableSource )*
+      { name: 'TableSourceList$ebnf$1', symbols: [] },
+      { name: 'TableSourceList$ebnf$1$subexpr$1', symbols: [{ type: 'comma' }, 'TableSource'] },
+      {
+        name: 'TableSourceList$ebnf$1',
+        symbols: ['TableSourceList$ebnf$1', 'TableSourceList$ebnf$1$subexpr$1'],
+        postprocess: d => d[0].concat([d[1]])
+      },
+      {
+        name: 'TableSourceList',
+        symbols: ['TableSource', 'TableSourceList$ebnf$1'],
+        postprocess: d => [d[0]].concat(d[1].map(x => x[1]))
+      },
+
+      // TableSource -> identifier | (SelectStmt) identifier  (subquery requires alias)
+      {
+        name: 'TableSource',
+        symbols: [{ type: 'identifier' }],
+        postprocess: d => node('Table', { name: d[0].value })
+      },
+      {
+        name: 'TableSource',
+        symbols: [{ type: 'lparen' }, 'SelectStmt', { type: 'rparen' }, { type: 'identifier' }],
+        postprocess: d => node('Subquery', { select: d[1], alias: d[3].value })
+      },
+
+      // WhereOpt -> (where BooleanExpression)?
+      {
+        name: 'WhereOpt',
+        symbols: [{ type: 'where' }, 'BooleanExpr'],
+        postprocess: d => d[1]
+      },
+      { name: 'WhereOpt', symbols: [], postprocess: () => null },
+
+      // BooleanExpr: simple comparison only for now (Value op Value)
+      {
+        name: 'BooleanExpr',
+        symbols: ['ValueExpr', { type: 'op' }, 'ValueExpr'],
+        postprocess: d => node('Compare', { left: d[0], op: d[1].value, right: d[2] })
+      },
+    ],
+    ParserStart: 'main'
+  };
+}
+
+  // --- Parser wrapper
+  function parseSQL(input) {
+    const cleaned = stripComments(input);
+    console.log('Parsing SQL:', cleaned);
+    const grammar = makeGrammar();
+    const parser = new nearley.Parser(nearley.Grammar.fromCompiled(grammar));
+    parser.feed(cleaned);
+    const results = parser.results;
+    if (!results || results.length === 0) throw new Error('No parse found.');
+    if (results.length > 1) {
+      return { ast: results[0], ambiguous: true, count: results.length };
+    }
+    return { ast: results[0], ambiguous: false, count: 1 };
+  }
+
+  // --- Rendering
+  function renderJSON(ast) {
+    document.getElementById('json').textContent = JSON.stringify(ast, null, 2);
+  }
+  function renderTree(ast) {
+    const root = document.getElementById('tree');
+    root.classList.remove('muted');
+    root.innerHTML = '';
+    function makeNode(obj){
+      const li=document.createElement('li');
+      const head=document.createElement('div'); head.className='node';
+      const badge=document.createElement('span'); badge.className='badge'; badge.textContent=obj.type||typeof obj; head.appendChild(badge);
+      const summary=document.createElement('span'); summary.className='key';
+      if (obj.type==='Table') summary.textContent=` name=${obj.name}${obj.alias?` alias=${obj.alias.name}`:''}`;
+      else if (obj.type==='ColumnRef') summary.textContent=' '+obj.parts.join('.');
+      else if (obj.type==='String') summary.textContent=` '${obj.value}'`;
+      else if (obj.type==='Number') summary.textContent=' '+obj.value;
+      else if (obj.type==='OrderItem') summary.textContent=' '+obj.direction;
+      else if (obj.type==='QualifiedStar') summary.textContent=` ${obj.table}.*`;
+      head.appendChild(summary); li.appendChild(head);
+      const ul=document.createElement('ul');
+      for(const [k,v] of Object.entries(obj)){
+        if(k==='type' || v==null) continue;
+        const child=document.createElement('li');
+        const line=document.createElement('div'); line.className='node';
+        const keySpan=document.createElement('span'); keySpan.className='muted'; keySpan.textContent=k+':'; line.appendChild(keySpan);
+        if(Array.isArray(v)){
+          const arr=document.createElement('ul'); v.forEach(it=>arr.appendChild(makeNode(it))); child.appendChild(line); child.appendChild(arr);
+        } else if(typeof v==='object'){
+          child.appendChild(line); const nested=document.createElement('ul'); nested.appendChild(makeNode(v)); child.appendChild(nested);
+        } else {
+          const val=document.createElement('span'); val.textContent=' '+String(v); line.appendChild(val); child.appendChild(line);
+        }
+        ul.appendChild(child);
+      }
+      li.appendChild(ul); return li;
+    }
+    const ul=document.createElement('ul'); ul.appendChild(makeNode(ast)); root.appendChild(ul);
+  }
+
+  // --- Wire up
+  const sqlEl=document.getElementById('sql');
+  const jsonEl=document.getElementById('json');
+  const treeEl=document.getElementById('tree');
+  const statusEl=document.getElementById('status');
+  document.getElementById('parseBtn').addEventListener('click',()=>{
+    try {
+      const { ast, ambiguous, count } = parseSQL(sqlEl.value);
+      renderJSON(ast); renderTree(ast);
+      statusEl.innerHTML = `<span class="ok">Parsed</span>${ambiguous?` — ambiguous (${count})`:''}`;
+    } catch (err) {
+      jsonEl.textContent = err && err.message ? err.message : String(err);
+      treeEl.textContent = '(no tree)'; treeEl.classList.add('muted');
+      statusEl.innerHTML = `<span class="err">Parse error:</span> ${err.message || err}`;
+    }
+  });
+  document.getElementById('clearBtn').addEventListener('click',()=>{
+    jsonEl.textContent='(empty)'; treeEl.textContent='(empty)'; treeEl.classList.add('muted'); statusEl.textContent='';
+  });
+  </script>
+</body>
+</html>
