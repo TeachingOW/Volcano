@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Relational-Algebra Optimizer Demo (HTML/JS)</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; padding:18px; background:#f7fafc; color:#0f172a}
+    .container{max-width:1100px;margin:0 auto}
+    textarea{width:100%;height:200px;padding:10px;font-family:monospace;box-sizing:border-box}
+    pre{background:#fff;padding:12px;border:1px solid #e2e8f0;border-radius:6px;overflow:auto}
+    button{background:#0ea5e9;border:none;color:#fff;padding:8px 12px;border-radius:6px;cursor:pointer}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    .card{background:#fff;padding:12px;border-radius:8px;border:1px solid #e6eef6}
+    h3{margin:8px 0}
+    .step{border-left:3px solid #cfeafe;padding:8px;margin:8px 0}
+    .compact{font-size:13px;color:#334155}
+    .small{font-size:13px}
+    label{font-weight:600}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Relational-Algebra Optimizer — HTML/JS Demo</h1>
+    <p class="compact">Paste a small JSON parse tree (format explained below), click <strong>Run</strong> and watch step-by-step logical rewrites and a simple DP join-order + physical algorithm choice.</p>
+
+    <div class="grid">
+      <div class="card">
+        <label>JSON parse tree (example provided)</label>
+        <textarea id="inputJson">{
+  "type": "Projection",
+  "cols": ["R.a","T.d"],
+  "child": {
+    "type": "Selection",
+    "predicate": "R.b = 5 AND S.c > 10",
+    "child": {
+      "type": "Join",
+      "condition": "S.y = T.y",
+      "left": {
+        "type": "Join",
+        "condition": "R.x = S.x",
+        "left": { "type": "Table", "name": "R", "rows": 1000, "ndv": {"x":200,"b":20} },
+        "right": { "type": "Table", "name": "S", "rows": 5000, "ndv": {"x":1000,"c":50,"y":100} }
+      },
+      "right": { "type": "Table", "name": "T", "rows": 200, "ndv": {"y":40,"d":100} }
+    }
+  }
+}</textarea>
+        <div style="margin-top:8px"><button id="runBtn">Run optimizer</button> <button id="resetBtn">Reset example</button></div>
+
+        <div style="margin-top:12px" class="small">
+          <div><strong>JSON node types</strong>:</div>
+          <ul class="small">
+            <li><code>Table</code>: {"type":"Table","name":"R","rows":1000,"ndv":{"col":10}}</li>
+            <li><code>Selection</code>: {"type":"Selection","predicate":"R.a = 5","child":...}</li>
+            <li><code>Projection</code>: {"type":"Projection","cols":["R.a","T.d"],"child":...}</li>
+            <li><code>Join</code>: {"type":"Join","condition":"R.x = S.x","left":...,"right":...}</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Trace & Results</h3>
+        <div id="traceArea">
+          <em class="small">No run yet — click <strong>Run optimizer</strong>.</em>
+        </div>
+      </div>
+    </div>
+
+    <div style="margin-top:12px" class="grid">
+      <div class="card">
+        <h3>Original tree (pretty)</h3>
+        <pre id="origTree">-</pre>
+      </div>
+      <div class="card">
+        <h3>Final logical tree + plan</h3>
+        <pre id="finalTree">-</pre>
+      </div>
+    </div>
+
+  </div>
+
+<script>
+// --- Small RA node classes ---
+class Table { constructor(name, rows=1000, ndv={}){ this.type='Table'; this.name=name; this.rows=rows; this.ndv=ndv } }
+class Selection { constructor(predicate, child){ this.type='Selection'; this.predicate=predicate; this.child=child } }
+class Projection { constructor(cols, child){ this.type='Projection'; this.cols=cols; this.child=child } }
+class Join { constructor(left,right,condition=null){ this.type='Join'; this.left=left; this.right=right; this.condition=condition } }
+
+// --- Utilities ---
+function tblcolRegex(){ return /([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)/g }
+function referencedTables(predicate){ if(!predicate) return new Set(); const r=new Set(); let m; const rx=tblcolRegex(); while((m=rx.exec(predicate))){ r.add(m[1]) } return r }
+function splitAnd(pred){ if(!pred) return []; return pred.split(/\s+AND\s+/i).map(s=>s.trim()).filter(Boolean) }
+function combineAnd(parts){ if(!parts || parts.length===0) return null; return parts.join(' AND ') }
+
+// --- Pretty printer ---
+function pretty(node, indent=0){ const pad='  '.repeat(indent); if(!node) return pad+'<empty>'; switch(node.type){
+  case 'Table': return pad+`Table ${node.name} [rows=${node.rows}]`;
+  case 'Selection': return pad+`Selection(${node.predicate})\n`+pretty(node.child, indent+1);
+  case 'Projection': return pad+`Projection(${node.cols.join(',')})\n`+pretty(node.child, indent+1);
+  case 'Join': return pad+`Join(${node.condition||'CROSS'})\n`+pretty(node.left, indent+1)+"\n"+pretty(node.right, indent+1);
+}
+}
+
+function clone(obj){ return JSON.parse(JSON.stringify(obj)) }
+
+// --- Logical rewrite rules ---
+function rule_distribute_selection_to_leaves(node){ if(!node || node.type!=='Selection') return null; const sel=node; const child=sel.child; if(!child || child.type!=='Join') return null; const parts=splitAnd(sel.predicate); let newChild=clone(child); let changed=false; for(const p of parts){ const refs=referencedTables(p); if(refs.size===1){ const tname=[...refs][0]; // wrap that table occurrence in subtree
+      const wrapped = wrapSelectionAroundTable(newChild, tname, p);
+      if(wrapped) { newChild=wrapped; changed=true } else { /* couldn't find */ }
+    } else { // multi-table predicate: attach to this join condition
+      if(newChild.condition) newChild.condition = newChild.condition + ' AND ' + p; else newChild.condition = p; changed=true
+    }
+  }
+  if(!changed) return null; return newChild }
+
+function wrapSelectionAroundTable(node, tableName, predicate){ // returns modified node or null if not found
+  if(node.type==='Table'){ if(node.name===tableName) return {type:'Selection', predicate:predicate, child:node}; return null }
+  if(node.type==='Selection' || node.type==='Projection'){ const childWrapped = wrapSelectionAroundTable(node.child, tableName, predicate); if(childWrapped){ node.child = childWrapped; return node } return null }
+  if(node.type==='Join'){ const leftWrapped = wrapSelectionAroundTable(node.left, tableName, predicate); if(leftWrapped){ node.left = leftWrapped; return node } const rightWrapped = wrapSelectionAroundTable(node.right, tableName, predicate); if(rightWrapped){ node.right = rightWrapped; return node } return null }
+  return null }
+
+function rule_merge_selections(node){ if(!node) return null; if(node.type==='Selection' && node.child && node.child.type==='Selection'){ return {type:'Selection', predicate: combineAnd([node.predicate, node.child.predicate]), child: node.child.child} } return null }
+
+function rule_push_projection_through_selection(node){ if(!node) return null; if(node.type==='Projection' && node.child && node.child.type==='Selection'){ const proj=node; const sel=proj.child; const predCols=[]; const rx=tblcolRegex(); let m; while((m=rx.exec(sel.predicate))){ predCols.push(m[0]) } const pushedCols = Array.from(new Set((proj.cols||[]).concat(predCols))); return {type:'Selection', predicate: sel.predicate, child: {type:'Projection', cols:pushedCols, child: sel.child}} } return null }
+
+function rule_push_projection_into_join(node){ if(!node) return null; if(node.type==='Projection' && node.child && node.child.type==='Join'){ const proj=node; const join=node.child; const joinCols=[]; if(join.condition){ const rx=tblcolRegex(); let m; while((m=rx.exec(join.condition))){ joinCols.push(m[0]) } }
+  // determine which projection columns go left/right by table name
+  const leftTables = referencedTablesFromTree(join.left); const rightTables = referencedTablesFromTree(join.right);
+  const leftCols=[], rightCols=[];
+  for(const c of proj.cols){ const t = c.includes('.')?c.split('.',1)[0]:null; if(leftTables.has(t)) leftCols.push(c); else if(rightTables.has(t)) rightCols.push(c) }
+  for(const jc of joinCols){ const t = jc.split('.')[0]; if(leftTables.has(t)) leftCols.push(jc); else if(rightTables.has(t)) rightCols.push(jc) }
+  const newLeft = leftCols.length? {type:'Projection', cols:Array.from(new Set(leftCols)), child: join.left} : join.left;
+  const newRight = rightCols.length? {type:'Projection', cols:Array.from(new Set(rightCols)), child: join.right} : join.right;
+  return {type:'Join', condition: join.condition, left: newLeft, right: newRight}
+}
+return null }
+
+function referencedTablesFromTree(node){ if(!node) return new Set(); if(node.type==='Table') return new Set([node.name]); if(node.type==='Selection' || node.type==='Projection') return referencedTablesFromTree(node.child); if(node.type==='Join'){ const a=referencedTablesFromTree(node.left); const b=referencedTablesFromTree(node.right); return new Set([...a,...b]) } return new Set() }
+
+// Apply rules until fixpoint and record steps
+function applyLogicalRules(root){ const rules = [rule_distribute_selection_to_leaves, rule_merge_selections, rule_push_projection_through_selection, rule_push_projection_into_join]; let current = clone(root); const steps=[]; while(true){ let applied=false; for(const rule of rules){ const res = applyRuleRecursive(current, rule); if(res.applied){ steps.push({name: rule.name || 'rule', where: res.where, tree: res.node}); current = res.node; applied=true; break } }
+    if(!applied) break }
+  return {final: current, steps: steps} }
+
+function applyRuleRecursive(node, rule){ // pre-order traversal
+  const res = rule(node);
+  if(res) return {applied:true, node: res, where: pretty(node).split('\n')[0]};
+  if(node.type==='Selection' || node.type==='Projection'){ const childRes = applyRuleRecursive(node.child, rule); if(childRes.applied){ node.child = childRes.node; return {applied:true, node: node, where: childRes.where + ' -> child'} } return {applied:false} }
+  if(node.type==='Join'){ const leftRes = applyRuleRecursive(node.left, rule); if(leftRes.applied){ node.left = leftRes.node; return {applied:true, node: node, where: leftRes.where + ' -> left'} } const rightRes = applyRuleRecursive(node.right, rule); if(rightRes.applied){ node.right = rightRes.node; return {applied:true, node: node, where: rightRes.where + ' -> right'} } return {applied:false} }
+  return {applied:false}
+}
+
+// --- Cost & DP join-order ---
+function estimateSelectionSelectivity(predicate, table){ if(!predicate) return 1.0; const parts = splitAnd(predicate); let sel=1.0; for(const p of parts){ const rx=tblcolRegex(); const m = rx.exec(p); if(!m){ sel *= 0.5; continue } rx.lastIndex = 0; const tname=m[1], col=m[2]; if(tname!==table.name) continue; if(p.includes('=') && /=\s*[^\.]/.test(p)){
+    const ndv = table.ndv && table.ndv[col]; sel *= ndv? 1.0/Math.max(ndv,1):0.1
+  } else if(/[<>]/.test(p)){ sel *= 0.3 } else sel *= 0.5 }
+  return Math.max(Math.min(sel,1.0),1e-6)
+}
+
+function estimateJoinRows(lrows, rrows, lndv=1, rndv=1){ const denom = Math.max(lndv||1, rndv||1); return Math.max(Math.floor(lrows * rrows / denom), 1) }
+
+function collectLeavesWithSelectivity(node){ const leaves={}; function rec(n){ if(!n) return; if(n.type==='Table'){ leaves[n.name] = {tbl: n, rows: n.rows}; return } if(n.type==='Selection' && n.child && n.child.type==='Table'){ const t = n.child; const sel = estimateSelectionSelectivity(n.predicate, t); leaves[t.name] = {tbl: t, rows: Math.max(Math.floor(t.rows * sel),1)}; return }
+  if(n.type==='Selection' || n.type==='Projection'){ rec(n.child); return } if(n.type==='Join'){ rec(n.left); rec(n.right); return } }
+  rec(node); return leaves }
+
+function extractJoinConditions(node){ const conds=[]; function rec(n){ if(!n) return; if(n.type==='Join' && n.condition){ const parts = splitAnd(n.condition); for(const p of parts){ const m = p.match(/\s*([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)\s*=\s*([A-Za-z0-9_]+)\.([A-Za-z0-9_]+)\s*/); if(m){ conds.push({a:m[1], b:m[3], ca:m[2], cb:m[4]}) } } }
+    if(n.type==='Join'){ rec(n.left); rec(n.right) } if(n.type==='Selection' || n.type==='Projection'){ rec(n.child) } }
+  rec(node); return conds }
+
+function dpJoinOrder(leafInfo, joinConditions){ const tables = Object.keys(leafInfo); const n = tables.length; const bestPlan = new Map(); for(const t of tables){ const tbl = leafInfo[t].tbl; const rows = leafInfo[t].rows; bestPlan.set(JSON.stringify([t].sort()), {cost: rows, rows: rows, plan: `Table(${t})`}) }
+  // subsets
+  for(let size=2; size<=n; size++){
+    const combos = combinations(tables,size);
+    for(const subset of combos){ const key = JSON.stringify([...subset].sort()); let best = null;
+      // partition
+      for(let r=1;r<size;r++){
+        const leftCombos = combinations(subset, r);
+        for(const left of leftCombos){ const leftKey = JSON.stringify([...left].sort()); const right = subset.filter(x=>!left.includes(x)); const rightKey = JSON.stringify([...right].sort()); const leftPlan = bestPlan.get(leftKey); const rightPlan = bestPlan.get(rightKey); if(!leftPlan || !rightPlan) continue;
+            // check connectivity
+            let connects=false; let lndv=1, rndv=1;
+            for(const jc of joinConditions){ if((left.includes(jc.a) && right.includes(jc.b)) || (left.includes(jc.b) && right.includes(jc.a))){ connects=true; lndv = leafInfo[jc.a].tbl.ndv[jc.ca]||10; rndv = leafInfo[jc.b].tbl.ndv[jc.cb]||10; break } }
+            if(!connects) continue;
+            const joinRows = estimateJoinRows(leftPlan.rows, rightPlan.rows, lndv, rndv);
+            const costHash = leftPlan.cost + rightPlan.cost + leftPlan.rows + rightPlan.rows;
+            const costNL = leftPlan.cost + rightPlan.cost + leftPlan.rows * rightPlan.rows;
+            const joinCost = Math.min(costHash, costNL);
+            const totalCost = leftPlan.cost + rightPlan.cost + joinCost;
+            const alg = costHash<=costNL? 'Hash':'NL'; const plan = `(${leftPlan.plan} ⋈[${alg}] ${rightPlan.plan})`;
+            if(!best || totalCost < best.cost){ best = {cost: totalCost, rows: joinRows, plan: plan} }
+        }
+      }
+      if(best) bestPlan.set(key, best);
+    }
+  }
+  const fullKey = JSON.stringify([...tables].sort()); return bestPlan.get(fullKey) }
+
+// helper to enumerate combinations (returns arrays)
+function combinations(arr, k){ const res=[]; function helper(start, cur){ if(cur.length===k){ res.push(cur.slice()); return } for(let i=start;i<arr.length;i++){ cur.push(arr[i]); helper(i+1, cur); cur.pop() } }
+  helper(0, []); return res }
+
+// --- Glue: JSON adapter and UI ---
+function jsonToNode(j){ if(!j) return null; const t=j.type; if(t==='Table') return {type:'Table', name:j.name, rows: j.rows||1000, ndv: j.ndv||{}}; if(t==='Selection') return {type:'Selection', predicate: j.predicate, child: jsonToNode(j.child)}; if(t==='Projection') return {type:'Projection', cols: j.cols||[], child: jsonToNode(j.child)}; if(t==='Join') return {type:'Join', condition: j.condition||null, left: jsonToNode(j.left), right: jsonToNode(j.right)}; throw new Error('Unknown node type: '+t) }
+
+function runOptimizer(){ const input = document.getElementById('inputJson').value; let parsed; try{ parsed = JSON.parse(input) }catch(e){ document.getElementById('traceArea').innerHTML = '<div style="color:crimson">Invalid JSON: '+e.message+'</div>'; return }
+  const root=jsonToNode(parsed);
+  document.getElementById('origTree').textContent = pretty(root);
+  const {final, steps} = applyLogicalRules(root);
+  // render steps
+  const ta=document.getElementById('traceArea'); ta.innerHTML=''; if(steps.length===0) ta.innerHTML='<div class="small">No logical rewrite applied.</div>';
+  steps.forEach((s,i)=>{ const el=document.createElement('div'); el.className='step'; el.innerHTML = `<strong>Step ${i+1}:</strong> Applied <code>${s.name}</code> at <em>${s.where}</em>\n<pre class='small'>${pretty(s.tree)}</pre>`; ta.appendChild(el) });
+
+  document.getElementById('finalTree').textContent = pretty(final);
+
+  // collect leaves & join plan
+  const leaves = collectLeavesWithSelectivity(final);
+  const leavesStr = Object.keys(leaves).map(n=>`${n}: base=${leaves[n].tbl.rows}, est=${leaves[n].rows}`).join('\n');
+  const joinConds = extractJoinConditions(final);
+  const jcStr = joinConds.map(c=>`${c.a}.${c.ca} = ${c.b}.${c.cb}`).join(', ');
+
+  const dp = dpJoinOrder(leaves, joinConds);
+  const summary = document.createElement('div'); summary.className='card'; summary.style.marginTop='8px';
+  summary.innerHTML = `<h4 class='small'>Leaf estimates</h4><pre class='small'>${leavesStr}</pre><h4 class='small'>Join conditions</h4><pre class='small'>${jcStr||'<none>'}</pre>`;
+  if(dp){ summary.innerHTML += `<h4 class='small'>Chosen physical plan</h4><pre class='small'>${dp.plan}\nEstimated cost=${dp.cost}, estimated rows=${dp.rows}</pre>` } else { summary.innerHTML += `<div class='small'>No connected join plan found by DP (maybe missing join conditions)</div>` }
+  ta.appendChild(summary);
+}
+
+// wire buttons
+document.getElementById('runBtn').addEventListener('click', runOptimizer);
+document.getElementById('resetBtn').addEventListener('click', ()=>{ document.getElementById('inputJson').value = document.getElementById('inputJson').value; runOptimizer(); });
+
+</script>
+</body>
+</html>
